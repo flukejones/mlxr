@@ -117,6 +117,9 @@ pub(crate) trait TypePromotion {
 }
 
 impl TypePromotion for Dtype {
+    // Exhaustive promotion table: explicit pairs document the rule per-pair.
+    // Don't collapse arms with identical bodies — the enumeration IS the spec.
+    #[allow(clippy::match_same_arms)]
     fn promote_with(self, other: Self) -> Self {
         use crate::dtype::Dtype::*;
         match (self, other) {

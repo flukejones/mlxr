@@ -927,9 +927,10 @@ fn expand_ellipsis_operations<'a>(
         return Cow::Borrowed(operations);
     }
 
-    if ellipsis_count > 1 {
-        panic!("Indexing with multiple ellipsis is not supported");
-    }
+    assert!(
+        ellipsis_count <= 1,
+        "Indexing with multiple ellipsis is not supported"
+    );
 
     let ellipsis_pos = operations
         .iter()

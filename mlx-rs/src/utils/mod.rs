@@ -312,12 +312,9 @@ where
         let raw_closure: *mut F = payload as *mut _;
         // Let the box take care of freeing the closure
         let mut closure = Box::from_raw(raw_closure);
-        let arrays = match mlx_vector_array_values(vector_array) {
-            Ok(arrays) => arrays,
-            Err(_) => {
-                let _ = Box::into_raw(closure); // prevent premature drop
-                return FAILURE;
-            }
+        let Ok(arrays) = mlx_vector_array_values(vector_array) else {
+            let _ = Box::into_raw(closure); // prevent premature drop
+            return FAILURE;
         };
         let result = closure(&arrays);
         let _ = Box::into_raw(closure); // prevent premature drop

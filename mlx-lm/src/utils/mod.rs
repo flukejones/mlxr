@@ -213,15 +213,12 @@ where
                 .bits()
                 .ok_or_else(|| Exception::custom("Cache is quantized but bits are not set"))?;
 
-            let (keys, values) = match (keys, values) {
-                (MaybeQuantizedKeys::Quantized(keys), MaybeQuantizedValues::Quantized(values)) => {
-                    (keys, values)
-                }
-                _ => {
-                    return Err(Exception::custom(
-                        "Both keys and values must be quantized when KV cache is quantized",
-                    ));
-                }
+            let (MaybeQuantizedKeys::Quantized(keys), MaybeQuantizedValues::Quantized(values)) =
+                (keys, values)
+            else {
+                return Err(Exception::custom(
+                    "Both keys and values must be quantized when KV cache is quantized",
+                ));
             };
 
             return quantized_scaled_dot_product_attention(
@@ -230,15 +227,12 @@ where
         }
     }
 
-    let (keys, values) = match (keys, values) {
-        (MaybeQuantizedKeys::Original(keys), MaybeQuantizedValues::Original(values)) => {
-            (keys, values)
-        }
-        _ => {
-            return Err(Exception::custom(
-                "Both keys and values must NOT be quantized when KV cache is NOT quantized",
-            ));
-        }
+    let (MaybeQuantizedKeys::Original(keys), MaybeQuantizedValues::Original(values)) =
+        (keys, values)
+    else {
+        return Err(Exception::custom(
+            "Both keys and values must NOT be quantized when KV cache is NOT quantized",
+        ));
     };
 
     mlx_rs::fast::scaled_dot_product_attention(

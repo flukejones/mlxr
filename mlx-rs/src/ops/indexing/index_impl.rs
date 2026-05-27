@@ -1108,7 +1108,7 @@ fn get_item_nd(
                 }
             }
         }
-        new_shape.extend(src.shape()[(axis_ as usize)..].iter().cloned());
+        new_shape.extend(src.shape()[(axis_ as usize)..].iter().copied());
 
         src = Cow::Owned(src.reshape(&new_shape)?);
     }

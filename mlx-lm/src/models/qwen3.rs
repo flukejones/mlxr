@@ -4,14 +4,12 @@ use std::{
 };
 
 use mlx_rs::{
-    argmax_axis, array,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt},
     nn,
-    ops::indexing::{IndexOp, NewAxis},
+    ops::indexing::IndexOp,
     quantization::MaybeQuantized,
     Array,
 };
@@ -19,13 +17,15 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use super::{decode_step, sample};
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    nn::ModelInput,
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
+        scaled_dot_product_attention, AttentionMask,
     },
 };
 
@@ -181,7 +181,7 @@ where
             keys = self.rope.forward(nn::RopeInput::new(&keys))?;
         }
 
-        let output = crate::utils::scaled_dot_product_attention(
+        let output = scaled_dot_product_attention(
             queries, keys, values, cache, self.scale, mask,
         )?
         .transpose_axes(&[0, 2, 1, 3])?
@@ -374,12 +374,6 @@ impl Qwen3Model {
     }
 }
 
-pub struct ModelInput<'a, C> {
-    pub inputs: &'a Array,
-    pub mask: Option<&'a Array>,
-    pub cache: &'a mut Vec<Option<C>>,
-}
-
 impl<C> Module<ModelInput<'_, C>> for Qwen3Model
 where
     C: KeyValueCache,
@@ -537,16 +531,6 @@ pub fn load_qwen3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     Ok(model)
 }
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits)
-        }
-    }
-}
-
 pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
@@ -556,7 +540,7 @@ pub struct Generate<'a, C> {
 
 impl<'a, C> Generate<'a, C>
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     pub fn new(
         model: &'a mut Model,
@@ -589,7 +573,7 @@ macro_rules! tri {
 
 impl<'a, C> Iterator for Generate<'a, C>
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     type Item = Result<Array, Exception>;
 
@@ -608,15 +592,7 @@ where
                 Some(Ok(y))
             }
             GenerateState::Decode { y } => {
-                let inputs = y.index((.., NewAxis));
-                let input = ModelInput {
-                    inputs: &inputs,
-                    mask: None,
-                    cache: self.cache,
-                };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits, self.temp));
-
+                let y = tri!(decode_step(self.model, self.cache, y, self.temp));
                 self.state = GenerateState::Decode { y: y.clone() };
 
                 Some(Ok(y))

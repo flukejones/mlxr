@@ -2,12 +2,13 @@ pub mod cache;
 pub mod error;
 // pub mod generate;
 pub mod models;
+pub mod nn;
 pub mod sampler;
 pub mod utils;
 
 use mlx_rs::Array;
 
-use crate::models::qwen3;
+use crate::nn::ModelInput as NnModelInput;
 
 pub struct ModelInputBuilder<'a, C, T> {
     pub y: &'a Array,
@@ -19,7 +20,7 @@ pub trait ModelInput<'a, C, T> {
     fn from_model_input_builder(builder: ModelInputBuilder<'a, C, T>) -> Self;
 }
 
-impl<'a, C> ModelInput<'a, C, Option<Array>> for qwen3::ModelInput<'a, C> {
+impl<'a, C> ModelInput<'a, C, Option<Array>> for NnModelInput<'a, C> {
     fn from_model_input_builder(builder: ModelInputBuilder<'a, C, Option<Array>>) -> Self {
         let ModelInputBuilder { y, cache, state } = builder;
 

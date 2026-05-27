@@ -180,24 +180,40 @@ pub fn clear_cache() {
     }
 }
 
-/// A compiled function that can be called.
-#[derive(Debug, Clone)]
-pub struct Compiled<F, G> {
+/// `Shape` (see [`compile::shape`]) selects the per-arity [`CallMut`] /
+/// [`compile_with_state::CallMutWithState`] impl. Defaults to `()` for
+/// source-compatibility with older `Compiled<F, G>` callers.
+#[derive(Debug)]
+pub struct Compiled<F, G, Shape = ()> {
+    shape: std::marker::PhantomData<Shape>,
     f_marker: std::marker::PhantomData<F>,
     state: CompiledState<G>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CompiledState<F> {
     f: F,
     shapeless: bool,
     id: usize,
+    /// Built on first call, reused on subsequent ones. Saves the per-call
+    /// `Box<dyn FnMut>` + `mlx_detail_compile` round-trip (~18 µs/call on
+    /// small clusters, Apple Silicon).
+    cached_compiled: Option<Closure<'static>>,
+    /// `compile_with_state` only: number of function outputs captured
+    /// during first-call tracing. mlx-c caches the compiled graph by
+    /// `id`, so subsequent calls hit the cache and `inner` doesn't
+    /// re-trace; the count must persist across calls.
+    cached_num_outputs: std::cell::Cell<Option<usize>>,
 }
+
+// SAFETY: the inner `*mut c_void` payload is always a `BoxedSliceFn` /
+// `BoxedSliceTryFn` (both `+ Send`); the mlx-c handle is function
+// pointers + that payload.
+unsafe impl<F: Send> Send for CompiledState<F> {}
 
 impl<F> Drop for CompiledState<F> {
     fn drop(&mut self) {
         unsafe {
-            // remove the compiled structure from the back end
             mlx_sys::mlx_detail_compile_erase(self.id);
         }
     }
@@ -207,7 +223,6 @@ fn type_id_to_usize<T>(_val: &T) -> usize
 where
     T: 'static,
 {
-    // hash type id to usize
     let type_id = std::any::TypeId::of::<T>();
     let mut hasher = DefaultHasher::new();
     type_id.hash(&mut hasher);

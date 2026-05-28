@@ -148,10 +148,14 @@ fn resolve_task_local_key() -> Option<Result<Array>> {
 
 fn resolve_thread_default_key() -> Result<Array> {
     THREAD_DEFAULT_STATE.with_borrow_mut(|slot| {
-        if slot.is_none() {
-            *slot = Some(RandomState::new()?);
+        if let Some(s) = slot {
+            s.next()
+        } else {
+            let mut s = RandomState::new()?;
+            let out = s.next();
+            *slot = Some(s);
+            out
         }
-        slot.as_mut().unwrap().next()
     })
 }
 
@@ -380,7 +384,7 @@ pub fn randint_device<'a, E: Into<Array>, T: ArrayElement>(
 ) -> Result<Array> {
     let lb: Array = lower.into();
     let ub: Array = upper.into();
-    let shape = shape.into_option().unwrap_or(lb.shape());
+    let shape = shape.into_option().unwrap_or_else(|| lb.shape());
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -429,7 +433,7 @@ pub fn bernoulli_device<'a>(
     let default_array = Array::from_f32(0.5);
     let p = p.into().unwrap_or(&default_array);
 
-    let shape = shape.into_option().unwrap_or(p.shape());
+    let shape = shape.into_option().unwrap_or_else(|| p.shape());
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -470,7 +474,7 @@ pub fn truncated_normal_device<'a, E: Into<Array>, T: ArrayElement>(
 ) -> Result<Array> {
     let lb: Array = lower.into();
     let ub: Array = upper.into();
-    let shape = shape.into_option().unwrap_or(lb.shape());
+    let shape = shape.into_option().unwrap_or_else(|| lb.shape());
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {

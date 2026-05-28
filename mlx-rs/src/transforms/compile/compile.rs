@@ -266,9 +266,7 @@ where
     type Args<'a> = &'a Array;
 
     fn call_mut<'a>(&mut self, args: Self::Args<'a>) -> Result<Array, Exception> {
-        let args = std::slice::from_ref(args);
-        let result = self.state.call_mut_with(args)?;
-        Ok(result.into_iter().next().unwrap())
+        self.state.call_mut_with_one(std::slice::from_ref(args))
     }
 }
 
@@ -279,9 +277,7 @@ where
     type Args<'a> = (&'a Array, &'a Array);
 
     fn call_mut<'a>(&mut self, args: Self::Args<'a>) -> Result<Array, Exception> {
-        let args = &[args.0, args.1];
-        let result = self.state.call_mut_with(args)?;
-        Ok(result.into_iter().next().unwrap())
+        self.state.call_mut_with_one(&[args.0, args.1])
     }
 }
 
@@ -292,9 +288,7 @@ where
     type Args<'a> = (&'a Array, &'a Array, &'a Array);
 
     fn call_mut<'a>(&mut self, args: Self::Args<'a>) -> Result<Array, Exception> {
-        let args = &[args.0, args.1, args.2];
-        let result = self.state.call_mut_with(args)?;
-        Ok(result.into_iter().next().unwrap())
+        self.state.call_mut_with_one(&[args.0, args.1, args.2])
     }
 }
 
@@ -316,9 +310,8 @@ where
     type Args<'a> = &'a Array;
 
     fn call_mut<'a>(&mut self, args: Self::Args<'a>) -> Result<Array, Exception> {
-        let args = std::slice::from_ref(args);
-        let result = self.state.fallible_call_mut_with(args)?;
-        Ok(result.into_iter().next().unwrap())
+        self.state
+            .fallible_call_mut_with_one(std::slice::from_ref(args))
     }
 }
 
@@ -329,9 +322,7 @@ where
     type Args<'a> = (&'a Array, &'a Array);
 
     fn call_mut<'a>(&mut self, args: Self::Args<'a>) -> Result<Array, Exception> {
-        let args = &[args.0, args.1];
-        let result = self.state.fallible_call_mut_with(args)?;
-        Ok(result.into_iter().next().unwrap())
+        self.state.fallible_call_mut_with_one(&[args.0, args.1])
     }
 }
 
@@ -342,9 +333,8 @@ where
     type Args<'a> = (&'a Array, &'a Array, &'a Array);
 
     fn call_mut<'a>(&mut self, args: Self::Args<'a>) -> Result<Array, Exception> {
-        let args = &[args.0, args.1, args.2];
-        let result = self.state.fallible_call_mut_with(args)?;
-        Ok(result.into_iter().next().unwrap())
+        self.state
+            .fallible_call_mut_with_one(&[args.0, args.1, args.2])
     }
 }
 
@@ -358,6 +348,20 @@ fn apply_compiled(
         mlx_sys::mlx_closure_apply(res, compiled.as_ptr(), inner_inputs_vector.as_ptr())
     })?;
     result_vector.try_into_values()
+}
+
+/// Single-output [`apply_compiled`]: reads the C-vector directly, no
+/// `Vec` allocation.
+#[inline]
+fn apply_compiled_one(
+    compiled: &Closure<'_>,
+    args: &[impl AsRef<Array>],
+) -> Result<Array, Exception> {
+    let inner_inputs_vector = VectorArray::try_from_iter(args.iter())?;
+    let result_vector = VectorArray::try_from_op(|res| unsafe {
+        mlx_sys::mlx_closure_apply(res, compiled.as_ptr(), inner_inputs_vector.as_ptr())
+    })?;
+    result_vector.try_into_one()
 }
 
 #[inline]
@@ -397,6 +401,23 @@ impl<F> CompiledState<F> {
         result
     }
 
+    pub(super) fn call_mut_with_one(
+        &mut self,
+        args: &[impl AsRef<Array>],
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(&[Array]) -> Vec<Array> + 'static,
+    {
+        if let Some(compiled) = self.cached_compiled.as_ref() {
+            return apply_compiled_one(compiled, args);
+        }
+        let inner_closure = Closure::new(&mut self.f);
+        let compiled = build_compiled(inner_closure, self.id, self.shapeless)?;
+        let result = apply_compiled_one(&compiled, args);
+        self.cached_compiled = Some(compiled);
+        result
+    }
+
     pub(super) fn fallible_call_mut_with(
         &mut self,
         args: &[impl AsRef<Array>],
@@ -410,6 +431,23 @@ impl<F> CompiledState<F> {
         let inner_closure = Closure::new_fallible(&mut self.f);
         let compiled = build_compiled(inner_closure, self.id, self.shapeless)?;
         let result = apply_compiled(&compiled, args);
+        self.cached_compiled = Some(compiled);
+        result
+    }
+
+    pub(super) fn fallible_call_mut_with_one(
+        &mut self,
+        args: &[impl AsRef<Array>],
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + 'static,
+    {
+        if let Some(compiled) = self.cached_compiled.as_ref() {
+            return apply_compiled_one(compiled, args);
+        }
+        let inner_closure = Closure::new_fallible(&mut self.f);
+        let compiled = build_compiled(inner_closure, self.id, self.shapeless)?;
+        let result = apply_compiled_one(&compiled, args);
         self.cached_compiled = Some(compiled);
         result
     }

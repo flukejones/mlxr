@@ -21,6 +21,7 @@ use super::{decode_step, sample};
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    loader::apply_post_load_memory_policy,
     nn::ModelInput,
     quantization::{resolve_quantization, QuantizationConfig},
     utils::{
@@ -549,6 +550,7 @@ pub fn load_llama_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     }
     drop(params);
     mlx_rs::transforms::eval_params(model.parameters()).map_err(Error::Exception)?;
+    apply_post_load_memory_policy();
 
     Ok(model)
 }

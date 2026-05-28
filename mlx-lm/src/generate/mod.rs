@@ -1,24 +1,32 @@
 use std::marker::PhantomData;
 
 use mlx_lm_utils::tokenizer::Tokenizer;
-use mlx_rs::{error::Exception, module::Module, Array};
+use mlx_rs::{error::Exception, module::Module, transforms::eval, Array};
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
+    cache::{KVCache, KeyValueCache},
     error::Error,
     generate::generate_token::{GenerateToken, Stage},
     sampler::{DefaultSampler, Sampler},
-    utils::try_unwrap,
     ModelInput, ModelOutput,
 };
 
 mod generate_token;
 
-pub struct Generate<M, I, S = DefaultSampler, C = ConcatKeyValueCache, T = ()> {
+macro_rules! tri {
+    ($expr:expr) => {
+        match $expr {
+            Ok(val) => val,
+            Err(e) => return Some(Err(e.into())),
+        }
+    };
+}
+
+pub struct Generate<M, I, S = DefaultSampler, C = KVCache, T = ()> {
     tokenizer: Tokenizer,
     token_generator: GenerateToken<M, I, S, C, T>,
     max_tokens: usize,
-    ids: Vec<u32>,
+    tokens: Vec<Array>,
 }
 
 impl Generate<(), ()> {
@@ -37,7 +45,7 @@ impl Generate<(), ()> {
     }
 }
 
-pub struct Builder<Tok, M, I, P, S = DefaultSampler, C = ConcatKeyValueCache, T = ()> {
+pub struct Builder<Tok, M, I, P, S = DefaultSampler, C = KVCache, T = ()> {
     pub tokenizer: Tok,
     pub model: M,
     pub model_input_marker: PhantomData<I>,
@@ -180,12 +188,12 @@ where
             stage,
         };
 
-        let ids = Vec::with_capacity(max_tokens);
+        let tokens = Vec::with_capacity(max_tokens);
         Generate {
             tokenizer,
             token_generator,
             max_tokens,
-            ids,
+            tokens,
         }
     }
 }
@@ -207,17 +215,21 @@ where
     type Item = Result<Response, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let token = try_unwrap!(self.token_generator.next()?);
-            let id = try_unwrap!(token.try_item());
-            self.ids.push(id);
-
-            if self.ids.len() >= self.max_tokens {
-                let text = try_unwrap!(self.tokenizer.decode(&self.ids, true));
-                let mut ids = Vec::with_capacity(self.max_tokens);
-                std::mem::swap(&mut self.ids, &mut ids);
-                return Some(Ok(Response { text, ids }));
-            }
+        // Accumulate the lazy (async-submitted) token graphs, then read
+        // them back in one host sync — never `.item()` per step, which
+        // would stall the pipeline on a coherence barrier every token.
+        while self.tokens.len() < self.max_tokens {
+            let token = tri!(self.token_generator.next()?);
+            self.tokens.push(token);
         }
+
+        tri!(eval(self.tokens.iter()));
+        let ids: Vec<u32> = self
+            .tokens
+            .drain(..)
+            .map(|t| t.item::<u32>())
+            .collect();
+        let text = tri!(self.tokenizer.decode(&ids, true));
+        Some(Ok(Response { text, ids }))
     }
 }

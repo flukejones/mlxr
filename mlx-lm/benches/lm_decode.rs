@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use mlx_lm::cache::ConcatKeyValueCache;
+use mlx_lm::cache::KVCache;
 use mlx_lm::models::{
     llama::{load_llama_model, Generate as LlamaGenerate, Model as LlamaModel},
     qwen3::{load_qwen3_model, Generate as Qwen3Generate, Model as Qwen3Model},
@@ -22,6 +22,9 @@ const SHORT_PROMPT_LEN: usize = 13;
 const WARMUP_TOKENS: i32 = 4;
 const SAMPLE_SIZE: usize = 10;
 const MEASUREMENT_SECS: u64 = 20;
+/// Realistic sampling temperature — exercises the categorical + cached
+/// `inv_temp` decode path, not the greedy argmax shortcut.
+const DECODE_TEMP: f32 = 0.7;
 
 /// Resolve `<cache>/<repo_id>`; download via `hf` on first miss.
 fn ensure_model(repo_id: &str) -> Option<PathBuf> {
@@ -171,9 +174,9 @@ fn run_qwen3_warmup(
     model: &mut Qwen3Model,
     prompt: &Array,
 ) -> Result<(), mlx_rs::error::Exception> {
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+    let mut cache: Vec<Option<KVCache>> = Vec::new();
     let mut tokens = Vec::new();
-    let iter = Qwen3Generate::<ConcatKeyValueCache>::new(model, &mut cache, 0.0, prompt);
+    let iter = Qwen3Generate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
     for (tok, n) in (iter).zip(0..WARMUP_TOKENS) {
         tokens.push(tok?);
         if n == 0 {
@@ -186,20 +189,20 @@ fn run_qwen3_warmup(
 
 /// Prompt prefill only: one `Generate::next()` eval'd; token discarded.
 fn time_qwen3_prefill(model: &mut Qwen3Model, prompt: &Array) -> Duration {
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let mut iter = Qwen3Generate::<ConcatKeyValueCache>::new(model, &mut cache, 0.0, prompt);
+    let mut cache: Vec<Option<KVCache>> = Vec::new();
+    let mut iter = Qwen3Generate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
     let t_start = Instant::now();
     let first = iter.next().expect("at least one token").unwrap();
     eval([&first]).unwrap();
     Instant::now() - t_start
 }
 
-/// Post-prefill decode timing: drives `Generate::next()` (the shared
-/// `decode_step`) one token at a time, `eval`-fenced. Synchronous, like
-/// production — no async pipelining yet.
+/// Decode timing via the production `Generate` iterator (the shared
+/// `decode_step`). `eval`-fence, not `.item()` — item's host readback
+/// hides the GPU decode cost.
 fn time_qwen3_decode(model: &mut Qwen3Model, prompt: &Array, steps: i32) -> Duration {
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let mut iter = Qwen3Generate::<ConcatKeyValueCache>::new(model, &mut cache, 0.0, prompt);
+    let mut cache: Vec<Option<KVCache>> = Vec::new();
+    let mut iter = Qwen3Generate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
     let first = iter.next().expect("at least one token").unwrap();
     eval([&first]).unwrap();
     let t_start = Instant::now();
@@ -264,8 +267,8 @@ fn bench_qwen3_group(
 }
 
 fn time_llama_prefill(model: &mut LlamaModel, prompt: &Array) -> Duration {
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let mut iter = LlamaGenerate::<ConcatKeyValueCache>::new(model, &mut cache, 0.0, prompt);
+    let mut cache: Vec<Option<KVCache>> = Vec::new();
+    let mut iter = LlamaGenerate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
     let t_start = Instant::now();
     let first = iter.next().expect("at least one token").unwrap();
     eval([&first]).unwrap();
@@ -273,8 +276,8 @@ fn time_llama_prefill(model: &mut LlamaModel, prompt: &Array) -> Duration {
 }
 
 fn time_llama_decode(model: &mut LlamaModel, prompt: &Array, steps: i32) -> Duration {
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let mut iter = LlamaGenerate::<ConcatKeyValueCache>::new(model, &mut cache, 0.0, prompt);
+    let mut cache: Vec<Option<KVCache>> = Vec::new();
+    let mut iter = LlamaGenerate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
     let first = iter.next().expect("at least one token").unwrap();
     eval([&first]).unwrap();
     let t_start = Instant::now();
@@ -289,9 +292,9 @@ fn run_llama_warmup(
     model: &mut LlamaModel,
     prompt: &Array,
 ) -> Result<(), mlx_rs::error::Exception> {
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+    let mut cache: Vec<Option<KVCache>> = Vec::new();
     let mut tokens = Vec::new();
-    let iter = LlamaGenerate::<ConcatKeyValueCache>::new(model, &mut cache, 0.0, prompt);
+    let iter = LlamaGenerate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
     for (tok, n) in (iter).zip(0..WARMUP_TOKENS) {
         tokens.push(tok?);
         if n == 0 {

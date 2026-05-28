@@ -11,13 +11,14 @@ use mlx_rs::{
     nn,
     ops::indexing::IndexOp,
     quantization::{MaybeQuantized, Quantizable as _},
+    transforms::async_eval,
     Array,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::{decode_step, sample};
+use super::{decode_step, inv_temp, sample_logits};
 use crate::{
     cache::KeyValueCache,
     error::Error,
@@ -157,23 +158,22 @@ where
         let mut keys = keys
             .reshape(&[B, L, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let mut values = values
+        let values = values
             .reshape(&[B, L, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        if let Some(cache) = cache.as_mut() {
+        let output = if let Some(cache) = cache.as_mut() {
             let offset = cache.offset();
             queries = self.rope.forward((&queries, offset))?;
             keys = self.rope.forward((&keys, offset))?;
-            (keys, values) = cache.update_and_fetch(keys, values)?;
+            cache.attention(&queries, keys, values, self.scale, mask)?
         } else {
             queries = self.rope.forward(&queries)?;
             keys = self.rope.forward(&keys)?;
+            scaled_dot_product_attention(queries, keys, values, None::<&mut C>, self.scale, mask)?
         }
-
-        let output = scaled_dot_product_attention(queries, keys, values, cache, self.scale, mask)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])?;
 
         self.o_proj.forward(&output)
     }
@@ -558,7 +558,9 @@ pub fn load_llama_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 pub struct Generate<'a, C> {
     model: &'a mut Model,
     cache: &'a mut Vec<Option<C>>,
-    temp: f32,
+    /// `1.0 / temp`, allocated once and reused — avoids a scalar `Array`
+    /// alloc per token. `None` for greedy (temp 0).
+    inv_temp: Option<Array>,
     state: GenerateState<'a>,
 }
 
@@ -575,15 +577,25 @@ where
         Self {
             model,
             cache,
-            temp,
+            inv_temp: inv_temp(temp),
             state: GenerateState::Prefill { prompt_token },
         }
     }
 }
 
 pub enum GenerateState<'a> {
-    Prefill { prompt_token: &'a Array },
-    Decode { y: Array },
+    Prefill {
+        prompt_token: &'a Array,
+    },
+    /// `last` not yet forwarded; first decode call primes the pipeline.
+    DecodeFirst {
+        last: Array,
+    },
+    /// `pending` already async-submitted; each step submits N+1 before
+    /// yielding N so the consumer's sync of N overlaps N+1.
+    Decode {
+        pending: Array,
+    },
 }
 
 macro_rules! tri {
@@ -593,6 +605,15 @@ macro_rules! tri {
             Err(e) => return Some(Err(e.into())),
         }
     };
+}
+
+impl<'a, C> Generate<'a, C>
+where
+    C: KeyValueCache + Default,
+{
+    fn step(&mut self, token: &Array) -> Result<Array, Exception> {
+        decode_step(self.model, self.cache, token, self.inv_temp.as_ref())
+    }
 }
 
 impl<'a, C> Iterator for Generate<'a, C>
@@ -610,16 +631,31 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
-                self.state = GenerateState::Decode { y: y.clone() };
+                let first = tri!(sample_logits(
+                    &logits.index((.., -1, ..)),
+                    self.inv_temp.as_ref()
+                ));
+                tri!(async_eval([&first]));
 
-                Some(Ok(y))
+                self.state = GenerateState::DecodeFirst {
+                    last: first.clone(),
+                };
+                Some(Ok(first))
             }
-            GenerateState::Decode { y } => {
-                let y = tri!(decode_step(self.model, self.cache, y, self.temp));
-                self.state = GenerateState::Decode { y: y.clone() };
+            GenerateState::DecodeFirst { last } => {
+                let last = last.clone();
+                let next = tri!(self.step(&last));
+                let pending = tri!(self.step(&next));
+                self.state = GenerateState::Decode { pending };
 
-                Some(Ok(y))
+                Some(Ok(next))
+            }
+            GenerateState::Decode { pending } => {
+                let pending = pending.clone();
+                let next = tri!(self.step(&pending));
+                self.state = GenerateState::Decode { pending: next };
+
+                Some(Ok(pending))
             }
         }
     }
@@ -637,7 +673,7 @@ mod tests {
     };
 
     use crate::{
-        cache::ConcatKeyValueCache,
+        cache::KVCache,
         models::llama::{load_llama_model, load_llama_tokenizer},
         nn::ModelInput,
     };
@@ -768,7 +804,7 @@ mod tests {
 
         let mut model = load_llama_model(CACHED_QUANT_TEST_MODEL_DIR.as_str()).unwrap();
         let prompt = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
-        let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut cache: Vec<Option<KVCache>> = Vec::new();
         let input = ModelInput {
             inputs: &prompt,
             mask: None,
@@ -794,12 +830,7 @@ mod tests {
         let eot_token_id = 128009u32;
 
         let mut token_ids = Vec::new();
-        let generate = super::Generate::<ConcatKeyValueCache>::new(
-            &mut model,
-            &mut cache,
-            0.0,
-            &prompt_tokens,
-        );
+        let generate = super::Generate::<KVCache>::new(&mut model, &mut cache, 0.0, &prompt_tokens);
         for (token, _ntoks) in generate.zip(0..50) {
             let token = token.unwrap();
             eval([&token]).unwrap();

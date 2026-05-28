@@ -6,19 +6,26 @@ use mlx_rs::{
     error::Exception,
     module::Module,
     ops::indexing::{IndexOp, NewAxis},
+    transforms::async_eval,
     Array,
 };
 
 use crate::{cache::KeyValueCache, nn::ModelInput};
 
-/// One decode step: reshape `last_id` to `[B, 1]`, forward, slice the
-/// last position, sample. The single per-token unit `Generate` and the
-/// bench share, so measurement can't drift from production.
+/// Cache `1.0 / temp` once for the decode loop; `None` for greedy (temp 0).
+pub fn inv_temp(temp: f32) -> Option<Array> {
+    (temp != 0.0).then(|| array!(1.0 / temp))
+}
+
+/// One pipelined decode step: reshape `last_id` to `[B, 1]`, forward,
+/// slice the last position, sample, `async_eval` the result so N+1 GPU
+/// compute overlaps the caller's sync on N. The single per-token unit
+/// `Generate` and the bench share, so measurement can't drift.
 pub fn decode_step<M, C>(
     model: &mut M,
     cache: &mut Vec<Option<C>>,
     last_id: &Array,
-    temp: f32,
+    inv_temp: Option<&Array>,
 ) -> Result<Array, Exception>
 where
     M: for<'a> Module<ModelInput<'a, C>, Output = Array, Error = Exception>,
@@ -30,16 +37,16 @@ where
         mask: None,
         cache,
     })?;
-    sample(&logits.index((.., -1, ..)), temp)
+    let next = sample_logits(&logits.index((.., -1, ..)), inv_temp)?;
+    async_eval([&next])?;
+    Ok(next)
 }
 
-/// Greedy `argmax` at temp 0, else temperature-scaled categorical.
-fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits)
-        }
+/// Greedy `argmax` when `inv_temp` is `None`, else categorical over
+/// `logits * inv_temp` (caller caches `inv_temp = 1/temp`).
+pub fn sample_logits(logits: &Array, inv_temp: Option<&Array>) -> Result<Array, Exception> {
+    match inv_temp {
+        None => argmax_axis!(logits, -1),
+        Some(inv_temp) => categorical!(&logits.multiply(inv_temp)?),
     }
 }

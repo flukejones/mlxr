@@ -1,11 +1,19 @@
 use std::marker::PhantomData;
 
-use mlx_rs::{error::Exception, module::Module, Array};
+use mlx_rs::{error::Exception, module::Module, transforms::async_eval, Array};
 
 use crate::{
-    cache::KeyValueCache, sampler::Sampler, utils::try_unwrap, ModelInput, ModelInputBuilder,
-    ModelOutput,
+    cache::KeyValueCache, sampler::Sampler, ModelInput, ModelInputBuilder, ModelOutput,
 };
+
+macro_rules! tri {
+    ($expr:expr) => {
+        match $expr {
+            Ok(val) => val,
+            Err(e) => return Some(Err(e.into())),
+        }
+    };
+}
 
 pub(super) enum Stage<C, T> {
     Generating,
@@ -13,8 +21,16 @@ pub(super) enum Stage<C, T> {
         prompt: Array,
         state: T,
     },
+    /// `last` not yet forwarded; first decode call primes the pipeline.
+    DecodeFirst {
+        last: Array,
+        cache: Vec<Option<C>>,
+        state: T,
+    },
+    /// `pending` already async-submitted; each step submits N+1 before
+    /// yielding N so the consumer's sync of N overlaps N+1.
     Decode {
-        y: Array,
+        pending: Array,
         cache: Vec<Option<C>>,
         state: T,
     },
@@ -38,6 +54,31 @@ pub(super) struct GenerateToken<M, I, S, C, T> {
     pub stage: Stage<C, T>,
 }
 
+impl<M, I, S, C, T> GenerateToken<M, I, S, C, T>
+where
+    M: Module<I>,
+    M::Error: Into<Exception>,
+    M::Output: ModelOutput,
+    for<'input> I: ModelInput<'input, C, T>,
+    S: Sampler,
+    C: KeyValueCache + Default,
+{
+    /// Forward + sample on `y`, async-submitted; returns the next token.
+    fn step(
+        &mut self,
+        y: &Array,
+        cache: &mut Vec<Option<C>>,
+        state: &mut T,
+    ) -> Result<Array, Exception> {
+        let builder = ModelInputBuilder { y, cache, state };
+        let input = I::from_model_input_builder(builder);
+        let output = self.model.forward(input).map_err(Into::into)?;
+        let next = self.sampler.sample(output.logits(), self.temp)?;
+        async_eval([&next])?;
+        Ok(next)
+    }
+}
+
 impl<M, I, S, C, T> Iterator for GenerateToken<M, I, S, C, T>
 where
     M: Module<I>,
@@ -50,58 +91,43 @@ where
     type Item = Result<Array, Exception>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Self {
-            model,
-            model_input_marker: _,
-            temp,
-            sampler,
-            stage,
-        } = self;
-
-        match stage.take() {
+        match self.stage.take() {
             Stage::Prefill { prompt, mut state } => {
                 let mut cache = Vec::new();
-                let builder = ModelInputBuilder {
-                    y: &prompt,
-                    cache: &mut cache,
-                    state: &mut state,
-                };
-                let input = I::from_model_input_builder(builder);
-                let output = try_unwrap!(model.forward(input));
-                let logits = output.logits();
-                let y = try_unwrap!(sampler.sample(logits, *temp));
-
-                *stage = Stage::Decode {
-                    y: y.clone(),
+                let first = tri!(self.step(&prompt, &mut cache, &mut state));
+                self.stage = Stage::DecodeFirst {
+                    last: first.clone(),
                     cache,
                     state,
                 };
-
-                Some(Ok(y))
+                Some(Ok(first))
             }
-            Stage::Decode {
-                y,
+            Stage::DecodeFirst {
+                last,
                 mut cache,
                 mut state,
             } => {
-                let builder = ModelInputBuilder {
-                    y: &y,
-                    cache: &mut cache,
-                    state: &mut state,
-                };
-
-                let input = I::from_model_input_builder(builder);
-                let output = try_unwrap!(model.forward(input));
-                let logits = output.logits();
-                let y = try_unwrap!(sampler.sample(logits, *temp));
-
-                *stage = Stage::Decode {
-                    y: y.clone(),
+                let next = tri!(self.step(&last, &mut cache, &mut state));
+                let pending = tri!(self.step(&next, &mut cache, &mut state));
+                self.stage = Stage::Decode {
+                    pending,
                     cache,
                     state,
                 };
-
-                Some(Ok(y))
+                Some(Ok(next))
+            }
+            Stage::Decode {
+                pending,
+                mut cache,
+                mut state,
+            } => {
+                let next = tri!(self.step(&pending, &mut cache, &mut state));
+                self.stage = Stage::Decode {
+                    pending: next,
+                    cache,
+                    state,
+                };
+                Some(Ok(pending))
             }
             Stage::Generating => unreachable!(),
         }

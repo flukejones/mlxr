@@ -2,6 +2,17 @@
 
 use serde::Deserialize;
 
+use crate::language_model::{LanguageModel, UserInputProcessor};
+
+/// What every family's `load_context` returns: the boxed model +
+/// processor + EOS-id list. `crate::model_context::load` wraps it into
+/// a `ModelContext`.
+pub type LoadedContext = (
+    Box<dyn LanguageModel>,
+    Box<dyn UserInputProcessor>,
+    Vec<u32>,
+);
+
 /// `config.json::eos_token_id` — either a single id or a list. Each
 /// family envelope carries `Option<EosSpec>` so the value is parsed
 /// once at load and read off the typed struct afterwards.

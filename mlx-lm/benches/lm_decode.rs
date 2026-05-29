@@ -5,11 +5,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use mlx_lm::cache::KVCache;
-use mlx_lm::models::{
-    llama::{load_llama_model, Generate as LlamaGenerate, Model as LlamaModel},
-    qwen3::{load_qwen3_model, Generate as Qwen3Generate, Model as Qwen3Model},
-};
+use mlx_lm::lm_input::{LMInput, Text};
+use mlx_lm::sampler::{Sampler, SamplerState};
+use mlx_lm::{decode_step, load, ModelContext};
 use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
     transforms::eval,
@@ -140,182 +138,71 @@ fn bench_only_skip(group_prefix: &str) -> bool {
     }
 }
 
-fn maybe_bench_qwen3(c: &mut Criterion, label: &str, repo_id: &str) {
-    if bench_only_skip(&format!("qwen3_decode_{label}")) {
+/// `[1, len]` int32 prompt as an `LMInput` (text-only).
+fn lm_input(prompt: &Array) -> LMInput {
+    LMInput {
+        text: Text {
+            tokens: prompt.clone(),
+            mask: None,
+        },
+    }
+}
+
+/// Prefill timing: one `prepare` eval'd; logits discarded.
+fn time_prefill(ctx: &mut ModelContext, prompt: &Array) -> Duration {
+    ctx.model.reset();
+    let t_start = Instant::now();
+    let logits = match ctx.model.prepare(lm_input(prompt)).unwrap() {
+        mlx_lm::PrepareResult::Logits(l) => l,
+        mlx_lm::PrepareResult::Primed => {
+            let seed = Array::from_slice::<i32>(&[0], &[1]);
+            ctx.model.step(&seed).unwrap().logits
+        }
+    };
+    eval([&logits]).unwrap();
+    Instant::now() - t_start
+}
+
+/// Decode timing through the exact production decode step
+/// ([`decode_step`], shared with `mlx_lm::generate`): N+1 is submitted
+/// before N is fenced, so the pipelining can't drift from production.
+/// `eval`-fence (not `.item()`, whose host readback hides decode cost).
+fn time_decode(ctx: &mut ModelContext, prompt: &Array, steps: i32) -> Duration {
+    ctx.model.reset();
+    let mut sampler = SamplerState::new(Sampler::Temperature(DECODE_TEMP));
+    let initial = match ctx.model.prepare(lm_input(prompt)).unwrap() {
+        mlx_lm::PrepareResult::Logits(l) => l,
+        mlx_lm::PrepareResult::Primed => {
+            let seed = Array::from_slice::<i32>(&[0], &[1]);
+            ctx.model.step(&seed).unwrap().logits
+        }
+    };
+    let mut pending = sampler.sample(&initial).unwrap();
+    // Fence prefill + first token before timing — otherwise the prompt
+    // forward (large for long prompts) folds into the first decode step.
+    eval([&pending]).unwrap();
+    let t_start = Instant::now();
+    for _ in 0..steps as usize {
+        let next = decode_step(ctx.model.as_mut(), &mut sampler, &pending).unwrap();
+        eval([&pending]).unwrap();
+        pending = next;
+    }
+    eval([&pending]).unwrap();
+    Instant::now() - t_start
+}
+
+fn maybe_bench(c: &mut Criterion, family: &str, label: &str, repo_id: &str) {
+    let group_name = format!("{family}_decode_{label}");
+    if bench_only_skip(&group_name) {
         return;
     }
     let Some(dir) = ensure_model(repo_id) else {
         return;
     };
-    let mut model = match load_qwen3_model(&dir) {
-        Ok(m) => m,
+    let mut ctx = match load(&dir) {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("skipping qwen3 {label}: load failed: {e:?}");
-            return;
-        }
-    };
-
-    let short = synthetic_prompt(SHORT_PROMPT_LEN, 1000);
-    let long = synthetic_prompt(LONG_PROMPT_LEN, 1000);
-    if let Err(e) = run_qwen3_warmup(&mut model, &short) {
-        eprintln!("skipping qwen3 {label}: warmup failed: {e:?}");
-        return;
-    }
-    bench_qwen3_group(
-        c,
-        &format!("qwen3_decode_{label}"),
-        &mut model,
-        &short,
-        &long,
-    );
-}
-
-fn run_qwen3_warmup(
-    model: &mut Qwen3Model,
-    prompt: &Array,
-) -> Result<(), mlx_rs::error::Exception> {
-    let mut cache: Vec<Option<KVCache>> = Vec::new();
-    let mut tokens = Vec::new();
-    let iter = Qwen3Generate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
-    for (tok, n) in (iter).zip(0..WARMUP_TOKENS) {
-        tokens.push(tok?);
-        if n == 0 {
-            eval(&tokens)?;
-        }
-    }
-    eval(&tokens)?;
-    Ok(())
-}
-
-/// Prompt prefill only: one `Generate::next()` eval'd; token discarded.
-fn time_qwen3_prefill(model: &mut Qwen3Model, prompt: &Array) -> Duration {
-    let mut cache: Vec<Option<KVCache>> = Vec::new();
-    let mut iter = Qwen3Generate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
-    let t_start = Instant::now();
-    let first = iter.next().expect("at least one token").unwrap();
-    eval([&first]).unwrap();
-    Instant::now() - t_start
-}
-
-/// Decode timing via the production `Generate` iterator (the shared
-/// `decode_step`). `eval`-fence, not `.item()` — item's host readback
-/// hides the GPU decode cost.
-fn time_qwen3_decode(model: &mut Qwen3Model, prompt: &Array, steps: i32) -> Duration {
-    let mut cache: Vec<Option<KVCache>> = Vec::new();
-    let mut iter = Qwen3Generate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
-    let first = iter.next().expect("at least one token").unwrap();
-    eval([&first]).unwrap();
-    let t_start = Instant::now();
-    for _ in 0..steps as usize {
-        let tok = iter.next().expect("token").unwrap();
-        eval([&tok]).unwrap();
-    }
-    Instant::now() - t_start
-}
-
-fn bench_qwen3_group(
-    c: &mut Criterion,
-    name: &str,
-    model: &mut Qwen3Model,
-    short: &Array,
-    long: &Array,
-) {
-    let decode_steps = DECODE_TOKENS - 1;
-    let mut group = c.benchmark_group(name);
-    group.sample_size(SAMPLE_SIZE);
-    group.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
-
-    for (label, prompt) in [
-        (
-            BenchmarkId::new("prefill_short", SHORT_PROMPT_LEN as i32),
-            short,
-        ),
-        (
-            BenchmarkId::new("prefill_long", LONG_PROMPT_LEN as i32),
-            long,
-        ),
-    ] {
-        let prompt_len = prompt.shape().last().copied().unwrap_or(0) as u64;
-        group.throughput(Throughput::Elements(prompt_len));
-        group.bench_function(label, |b| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    total += time_qwen3_prefill(model, prompt);
-                }
-                total
-            });
-        });
-    }
-
-    group.throughput(Throughput::Elements(decode_steps as u64));
-    for (label, prompt) in [
-        (BenchmarkId::new("decode_short", decode_steps), short),
-        (BenchmarkId::new("decode_long", decode_steps), long),
-    ] {
-        group.bench_function(label, |b| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    total += time_qwen3_decode(model, prompt, decode_steps);
-                }
-                total
-            });
-        });
-    }
-    group.finish();
-}
-
-fn time_llama_prefill(model: &mut LlamaModel, prompt: &Array) -> Duration {
-    let mut cache: Vec<Option<KVCache>> = Vec::new();
-    let mut iter = LlamaGenerate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
-    let t_start = Instant::now();
-    let first = iter.next().expect("at least one token").unwrap();
-    eval([&first]).unwrap();
-    Instant::now() - t_start
-}
-
-fn time_llama_decode(model: &mut LlamaModel, prompt: &Array, steps: i32) -> Duration {
-    let mut cache: Vec<Option<KVCache>> = Vec::new();
-    let mut iter = LlamaGenerate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
-    let first = iter.next().expect("at least one token").unwrap();
-    eval([&first]).unwrap();
-    let t_start = Instant::now();
-    for _ in 0..steps as usize {
-        let tok = iter.next().expect("token").unwrap();
-        eval([&tok]).unwrap();
-    }
-    Instant::now() - t_start
-}
-
-fn run_llama_warmup(
-    model: &mut LlamaModel,
-    prompt: &Array,
-) -> Result<(), mlx_rs::error::Exception> {
-    let mut cache: Vec<Option<KVCache>> = Vec::new();
-    let mut tokens = Vec::new();
-    let iter = LlamaGenerate::<KVCache>::new(model, &mut cache, DECODE_TEMP, prompt);
-    for (tok, n) in (iter).zip(0..WARMUP_TOKENS) {
-        tokens.push(tok?);
-        if n == 0 {
-            eval(&tokens)?;
-        }
-    }
-    eval(&tokens)?;
-    Ok(())
-}
-
-fn maybe_bench_llama(c: &mut Criterion, label: &str, repo_id: &str) {
-    if bench_only_skip(&format!("llama_decode_{label}")) {
-        return;
-    }
-    let Some(dir) = ensure_model(repo_id) else {
-        return;
-    };
-    let mut model = match load_llama_model(&dir) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("skipping llama {label}: load failed: {e:?}");
+            eprintln!("skipping {group_name}: load failed: {e:?}");
             return;
         }
     };
@@ -323,13 +210,13 @@ fn maybe_bench_llama(c: &mut Criterion, label: &str, repo_id: &str) {
     let short = synthetic_prompt(SHORT_PROMPT_LEN, 1000);
     let long = synthetic_prompt(LONG_PROMPT_LEN, 1000);
 
-    if let Err(e) = run_llama_warmup(&mut model, &short) {
-        eprintln!("skipping llama {label}: warmup failed: {e:?}");
-        return;
+    // Warm the compile/kernel cache outside the timing window.
+    for _ in 0..WARMUP_TOKENS {
+        let _ = time_decode(&mut ctx, &short, 1);
     }
 
     let decode_steps = DECODE_TOKENS - 1;
-    let mut group = c.benchmark_group(format!("llama_decode_{label}"));
+    let mut group = c.benchmark_group(&group_name);
     group.sample_size(SAMPLE_SIZE);
     group.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
 
@@ -349,7 +236,7 @@ fn maybe_bench_llama(c: &mut Criterion, label: &str, repo_id: &str) {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    total += time_llama_prefill(&mut model, prompt);
+                    total += time_prefill(&mut ctx, prompt);
                 }
                 total
             });
@@ -365,7 +252,7 @@ fn maybe_bench_llama(c: &mut Criterion, label: &str, repo_id: &str) {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    total += time_llama_decode(&mut model, prompt, decode_steps);
+                    total += time_decode(&mut ctx, prompt, decode_steps);
                 }
                 total
             });
@@ -393,20 +280,50 @@ fn bench_decode(c: &mut Criterion) {
     let set = bench_set();
     eprintln!("lm_decode bench set: {set:?} (override with MLX_LM_BENCH_SET={{trimmed,full}})");
 
-    maybe_bench_qwen3(c, "large_bf16", "mlx-community/Qwen3-1.7B-bf16");
-    maybe_bench_qwen3(c, "large_q8", "mlx-community/Qwen3-1.7B-8bit");
-    maybe_bench_qwen3(c, "large_q4", "mlx-community/Qwen3-1.7B-4bit");
-    maybe_bench_llama(c, "small_bf16", "mlx-community/Llama-3.2-1B-Instruct-bf16");
-    maybe_bench_llama(c, "small_q8", "mlx-community/Llama-3.2-1B-Instruct-8bit");
-    maybe_bench_llama(c, "small_q4", "mlx-community/Llama-3.2-1B-Instruct-4bit");
+    maybe_bench(c, "qwen3", "large_bf16", "mlx-community/Qwen3-1.7B-bf16");
+    maybe_bench(c, "qwen3", "large_q8", "mlx-community/Qwen3-1.7B-8bit");
+    maybe_bench(c, "qwen3", "large_q4", "mlx-community/Qwen3-1.7B-4bit");
+    maybe_bench(
+        c,
+        "llama",
+        "small_bf16",
+        "mlx-community/Llama-3.2-1B-Instruct-bf16",
+    );
+    maybe_bench(
+        c,
+        "llama",
+        "small_q8",
+        "mlx-community/Llama-3.2-1B-Instruct-8bit",
+    );
+    maybe_bench(
+        c,
+        "llama",
+        "small_q4",
+        "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    );
 
     if set == BenchSet::Full {
-        maybe_bench_qwen3(c, "small_bf16", "mlx-community/Qwen3-0.6B-bf16");
-        maybe_bench_qwen3(c, "small_q8", "mlx-community/Qwen3-0.6B-8bit");
-        maybe_bench_qwen3(c, "small_q4", "mlx-community/Qwen3-0.6B-4bit");
-        maybe_bench_llama(c, "large_bf16", "mlx-community/Llama-3.2-3B-Instruct-bf16");
-        maybe_bench_llama(c, "large_q8", "mlx-community/Llama-3.2-3B-Instruct-8bit");
-        maybe_bench_llama(c, "large_q4", "mlx-community/Llama-3.2-3B-Instruct-4bit");
+        maybe_bench(c, "qwen3", "small_bf16", "mlx-community/Qwen3-0.6B-bf16");
+        maybe_bench(c, "qwen3", "small_q8", "mlx-community/Qwen3-0.6B-8bit");
+        maybe_bench(c, "qwen3", "small_q4", "mlx-community/Qwen3-0.6B-4bit");
+        maybe_bench(
+            c,
+            "llama",
+            "large_bf16",
+            "mlx-community/Llama-3.2-3B-Instruct-bf16",
+        );
+        maybe_bench(
+            c,
+            "llama",
+            "large_q8",
+            "mlx-community/Llama-3.2-3B-Instruct-8bit",
+        );
+        maybe_bench(
+            c,
+            "llama",
+            "large_q4",
+            "mlx-community/Llama-3.2-3B-Instruct-4bit",
+        );
     }
 }
 

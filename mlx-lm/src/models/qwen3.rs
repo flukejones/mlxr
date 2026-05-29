@@ -9,23 +9,20 @@ use mlx_rs::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters},
     nn,
-    ops::indexing::IndexOp,
     quantization::{MaybeQuantized, Quantizable as _},
-    transforms::async_eval,
     Array,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::{decode_step, inv_temp, sample_logits};
 use crate::{
     cache::KeyValueCache,
     config::{Family, ModelConfig},
     error::Error,
     family::EosSpec,
     loader::apply_post_load_memory_policy,
-    nn::ModelInput,
+    nn::{ensure_cache_populated, AttentionInput, ModelInput, SwigluMlp},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -132,13 +129,6 @@ impl Attention {
     }
 }
 
-// TODO: check if this input can be generic for other attention modules
-pub struct AttentionInput<'a, C> {
-    pub x: &'a Array,
-    pub mask: Option<&'a Array>,
-    pub cache: Option<&'a mut C>,
-}
-
 impl<C> Module<AttentionInput<'_, C>> for Attention
 where
     C: KeyValueCache + Default,
@@ -201,59 +191,6 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
-pub struct Mlp {
-    #[quantizable]
-    #[param]
-    pub gate_proj: MaybeQuantized<nn::Linear>,
-
-    #[quantizable]
-    #[param]
-    pub down_proj: MaybeQuantized<nn::Linear>,
-
-    #[quantizable]
-    #[param]
-    pub up_proj: MaybeQuantized<nn::Linear>,
-}
-
-impl Mlp {
-    pub fn new(dim: i32, hidden_dim: i32) -> Result<Self, Exception> {
-        let gate_proj = nn::LinearBuilder::new(dim, hidden_dim)
-            .bias(false)
-            .build()?;
-        let down_proj = nn::LinearBuilder::new(hidden_dim, dim)
-            .bias(false)
-            .build()?;
-        let up_proj = nn::LinearBuilder::new(dim, hidden_dim)
-            .bias(false)
-            .build()?;
-
-        Ok(Self {
-            gate_proj: MaybeQuantized::Original(gate_proj),
-            down_proj: MaybeQuantized::Original(down_proj),
-            up_proj: MaybeQuantized::Original(up_proj),
-        })
-    }
-}
-
-impl Module<&Array> for Mlp {
-    type Output = Array;
-
-    type Error = Exception;
-
-    fn forward(&mut self, input: &Array) -> Result<Self::Output, Self::Error> {
-        let down_proj_input =
-            nn::silu(self.gate_proj.forward(input)?)?.multiply(self.up_proj.forward(input)?)?;
-        self.down_proj.forward(&down_proj_input)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.gate_proj.training_mode(mode);
-        self.down_proj.training_mode(mode);
-        self.up_proj.training_mode(mode);
-    }
-}
-
-#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct TransformerBlock {
     pub num_attention_heads: i32,
     pub hidden_size: i32,
@@ -264,7 +201,7 @@ pub struct TransformerBlock {
 
     #[quantizable]
     #[param]
-    pub mlp: Mlp,
+    pub mlp: SwigluMlp,
 
     #[param]
     pub input_layernorm: nn::RmsNorm,
@@ -279,7 +216,7 @@ impl TransformerBlock {
         let hidden_size = args.hidden_size;
 
         let self_attn = Attention::new(args)?;
-        let mlp = Mlp::new(args.hidden_size, args.intermediate_size)?;
+        let mlp = SwigluMlp::new(args.hidden_size, args.intermediate_size, false)?;
         let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
             .eps(args.rms_norm_eps)
             .build()?;
@@ -401,9 +338,7 @@ where
             },
         };
 
-        if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
-        }
+        ensure_cache_populated(cache, self.layers.len());
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
             let layer_input = AttentionInput {
@@ -556,126 +491,11 @@ pub fn load_qwen3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     Ok(model)
 }
 
-pub struct Generate<'a, C> {
-    model: &'a mut Model,
-    cache: &'a mut Vec<Option<C>>,
-    /// `1.0 / temp`, allocated once and reused — avoids a scalar `Array`
-    /// alloc per token. `None` for greedy (temp 0).
-    inv_temp: Option<Array>,
-    state: GenerateState<'a>,
-}
-
-impl<'a, C> Generate<'a, C>
-where
-    C: KeyValueCache + Default,
-{
-    pub fn new(
-        model: &'a mut Model,
-        cache: &'a mut Vec<Option<C>>,
-        temp: f32,
-        prompt_token: &'a Array,
-    ) -> Self {
-        Self {
-            model,
-            cache,
-            inv_temp: inv_temp(temp),
-            state: GenerateState::Prefill { prompt_token },
-        }
-    }
-}
-
-pub enum GenerateState<'a> {
-    Prefill {
-        prompt_token: &'a Array,
-    },
-    /// `last` not yet forwarded; first decode call primes the pipeline.
-    DecodeFirst {
-        last: Array,
-    },
-    /// `pending` already async-submitted; each step submits N+1 before
-    /// yielding N so the consumer's sync of N overlaps N+1.
-    Decode {
-        pending: Array,
-    },
-}
-
-macro_rules! tri {
-    ($expr:expr) => {
-        match $expr {
-            Ok(val) => val,
-            Err(e) => return Some(Err(e.into())),
-        }
-    };
-}
-
-impl<'a, C> Generate<'a, C>
-where
-    C: KeyValueCache + Default,
-{
-    fn step(&mut self, token: &Array) -> Result<Array, Exception> {
-        decode_step(self.model, self.cache, token, self.inv_temp.as_ref())
-    }
-}
-
-impl<'a, C> Iterator for Generate<'a, C>
-where
-    C: KeyValueCache + Default,
-{
-    type Item = Result<Array, Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &self.state {
-            GenerateState::Prefill { prompt_token } => {
-                let input = ModelInput {
-                    inputs: prompt_token,
-                    mask: None,
-                    cache: self.cache,
-                };
-                let logits = tri!(self.model.forward(input));
-                let first = tri!(sample_logits(
-                    &logits.index((.., -1, ..)),
-                    self.inv_temp.as_ref()
-                ));
-                tri!(async_eval([&first]));
-
-                self.state = GenerateState::DecodeFirst {
-                    last: first.clone(),
-                };
-                Some(Ok(first))
-            }
-            GenerateState::DecodeFirst { last } => {
-                let last = last.clone();
-                let next = tri!(self.step(&last));
-                let pending = tri!(self.step(&next));
-                self.state = GenerateState::Decode { pending };
-
-                Some(Ok(next))
-            }
-            GenerateState::Decode { pending } => {
-                let pending = pending.clone();
-                let next = tri!(self.step(&pending));
-                self.state = GenerateState::Decode { pending: next };
-
-                Some(Ok(pending))
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use mlx_rs::{
-        module::Module,
-        ops::indexing::{IndexOp, NewAxis},
-        transforms::eval,
-        Array,
-    };
+    use mlx_rs::{module::Module, transforms::eval, Array};
 
-    use crate::{
-        cache::KVCache,
-        models::qwen3::{load_qwen3_model, load_qwen3_tokenizer},
-        nn::ModelInput,
-    };
+    use crate::{cache::KVCache, models::qwen3::load_qwen3_tokenizer};
 
     const CACHED_TEST_MODEL_DIR: &str = "../cache/Qwen3-4B-bf16";
 
@@ -697,7 +517,7 @@ mod tests {
         let mut model = super::load_qwen3_model(CACHED_QUANT_TEST_MODEL_DIR).unwrap();
         let prompt = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
         let mut cache: Vec<Option<KVCache>> = Vec::new();
-        let input = ModelInput {
+        let input = super::ModelInput {
             inputs: &prompt,
             mask: None,
             cache: &mut cache,
@@ -717,38 +537,24 @@ mod tests {
 
     #[test]
     #[ignore = "requires local model files"]
-    fn test_load_and_run_qwen3_with_concat_cache() {
-        let tokenizer = load_qwen3_tokenizer(CACHED_TEST_MODEL_DIR).unwrap();
+    fn test_load_and_run_qwen3_via_generate() {
+        use std::ops::ControlFlow;
 
-        let mut model = load_qwen3_model(CACHED_TEST_MODEL_DIR).unwrap();
+        use crate::model_context::{generate, load, GenerateParams};
+        use crate::sampler::Sampler;
+        use crate::user_input::UserInput;
 
-        let encoding = tokenizer.encode("hello", true).unwrap();
-        let prompt_tokens = Array::from(encoding.get_ids()).index(NewAxis);
-        let mut cache = Vec::new();
-
-        let mut tokens = Vec::new();
-        let generate = super::Generate::<KVCache>::new(&mut model, &mut cache, 0.0, &prompt_tokens);
-        for (token, ntoks) in generate.zip(0..10) {
-            let token = token.unwrap();
-            tokens.push(token.clone());
-
-            if ntoks == 0 {
-                eval(&tokens).unwrap();
-            }
-
-            if tokens.len() % 20 == 0 {
-                eval(&tokens).unwrap();
-                let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
-                let s = tokenizer.decode(&slice, true).unwrap();
-                print!("{s}");
-            }
-        }
-
-        eval(&tokens).unwrap();
-        let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
-        let s = tokenizer.decode(&slice, true).unwrap();
-        println!("{s}");
-
-        println!("------");
+        let mut ctx = load(CACHED_TEST_MODEL_DIR).unwrap();
+        let params = GenerateParams {
+            max_new_tokens: 10,
+            sampling: Sampler::Greedy,
+            ..Default::default()
+        };
+        let result = generate(&mut ctx, UserInput::text("hello"), params, &mut |_, _| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        println!("{}", result.text);
+        assert!(result.completion_tokens > 0);
     }
 }

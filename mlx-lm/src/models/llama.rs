@@ -21,19 +21,22 @@ use tokenizers::Tokenizer;
 use super::{decode_step, inv_temp, sample_logits};
 use crate::{
     cache::KeyValueCache,
+    config::{Family, ModelConfig},
     error::Error,
+    family::EosSpec,
     loader::apply_post_load_memory_policy,
     nn::ModelInput,
-    quantization::{resolve_quantization, QuantizationConfig},
     utils::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         scaled_dot_product_attention,
     },
 };
 
+/// Llama config body. `model_type` is the serde tag on
+/// [`crate::config::Family`]; quantization lives on the outer
+/// [`crate::config::ModelConfig`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
-    pub model_type: String,
     pub hidden_size: i32,
     pub num_hidden_layers: i32,
     pub intermediate_size: i32,
@@ -52,9 +55,7 @@ pub struct ModelArgs {
     pub mlp_bias: bool,
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     #[serde(default)]
-    pub quantization: Option<QuantizationConfig>,
-    #[serde(default)]
-    pub quantization_config: Option<QuantizationConfig>,
+    pub eos_token_id: Option<EosSpec>,
 }
 
 fn default_true() -> bool {
@@ -447,10 +448,6 @@ impl Model {
             lm_head,
         })
     }
-
-    pub fn model_type(&self) -> &str {
-        &self.args.model_type
-    }
 }
 
 impl<C> Module<ModelInput<'_, C>> for Model
@@ -486,14 +483,6 @@ pub fn load_llama_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Er
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
-pub fn get_llama_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
-    let model_args_filename = model_dir.as_ref().join("config.json");
-    let file = std::fs::File::open(model_args_filename)?;
-    let model_args: ModelArgs = serde_json::from_reader(file)?;
-
-    Ok(model_args)
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeightMap {
     pub metadata: HashMap<String, Value>,
@@ -502,10 +491,12 @@ pub struct WeightMap {
 
 pub fn load_llama_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    let model_args = get_llama_model_args(model_dir)?;
-    let quant =
-        resolve_quantization(&model_args.quantization, &model_args.quantization_config).cloned();
-    let mut model = Model::new(model_args)?;
+    let cfg = ModelConfig::from_dir(model_dir)?;
+    let quant = cfg.quantization().cloned();
+    let Family::Llama(args) = cfg.family else {
+        return Err(Error::config("config.json model_type is not llama"));
+    };
+    let mut model = Model::new(args)?;
     if let Some(q) = quant {
         model = model.try_into_quantized(q.group_size, q.bits)?;
     }
@@ -674,6 +665,7 @@ mod tests {
 
     use crate::{
         cache::KVCache,
+        config::{Family, ModelConfig},
         models::llama::{load_llama_model, load_llama_tokenizer},
         nn::ModelInput,
     };
@@ -737,8 +729,11 @@ mod tests {
         use mlx_rs::module::ModuleParameters;
 
         let model_dir = CACHED_TEST_MODEL_DIR.as_str();
-        let model_args = super::get_llama_model_args(model_dir).unwrap();
-        let model = super::Model::new(model_args).unwrap();
+        let cfg = ModelConfig::from_dir(model_dir).unwrap();
+        let Family::Llama(args) = cfg.family else {
+            panic!("expected llama config");
+        };
+        let model = super::Model::new(args).unwrap();
 
         // Print some model parameter keys
         let params = model.parameters().flatten();

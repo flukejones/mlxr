@@ -92,7 +92,9 @@ pub(crate) fn quantized_scaled_dot_product_attention(
     let n_kv_heads = q_keys_shape[q_keys_shape.len() - 3];
     let n_repeats = n_q_heads / n_kv_heads;
 
-    let mut queries = queries * scale;
+    // f32 scale would promote bf16/fp16 queries; stage it into q dtype.
+    let scale = Array::from_f32(scale).as_dtype(queries.dtype())?;
+    let mut queries = queries.multiply(&scale)?;
 
     if n_repeats > 1 {
         queries = reshape(&queries, &[B, n_kv_heads, n_repeats, L, D])?;
@@ -120,8 +122,10 @@ pub(crate) fn quantized_scaled_dot_product_attention(
         // TODO: handle str type mask
 
         if mask.dtype() == Dtype::Bool {
-            let finfo_min = scores.dtype().finfo_min()?;
-            scores = mlx_rs::ops::r#where(mask, scores, Array::from_f64(finfo_min))?;
+            // f32 sentinel cast to scores dtype; Metal rejects f64.
+            let finfo_min = scores.dtype().finfo_min()? as f32;
+            let sentinel = Array::from_f32(finfo_min).as_dtype(scores.dtype())?;
+            scores = mlx_rs::ops::r#where(mask, scores, sentinel)?;
         } else {
             scores += mask;
         }

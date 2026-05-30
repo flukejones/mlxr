@@ -1,4 +1,5 @@
 use mlx_rs::{
+    nn::log_softmax,
     ops::{
         argsort_axis, cumsum,
         indexing::{argmax_axis, take_along_axis, Ellipsis, IndexOp, NewAxis},
@@ -70,6 +71,34 @@ impl SamplerState {
         }
     }
 
+    /// The configured strategy. Lets speculative-decode callers branch
+    /// on greedy vs top-p without re-deriving it.
+    pub fn sampler(&self) -> Sampler {
+        self.sampler
+    }
+
+    /// Temperature-scaled, optionally top-p-masked log-probabilities.
+    /// Used by MTP rejection sampling to compare draft vs verify
+    /// distributions. Errors on `Greedy` (no temperature).
+    pub fn masked_log_probs(
+        &mut self,
+        logits: &Array,
+        keep_mask: Option<&Array>,
+    ) -> Result<Array, Error> {
+        if matches!(self.sampler, Sampler::Greedy) {
+            return Err(Error::config(
+                "masked_log_probs: Sampler::Greedy has no temperature; greedy callers use argmax",
+            ));
+        }
+        let dtype = logits.dtype();
+        self.bind(dtype)?;
+        let inv_temp = self
+            .inv_temp
+            .as_ref()
+            .expect("inv_temp populated by bind()");
+        masked_temp_log_probs(logits, keep_mask, inv_temp)
+    }
+
     /// Sample one token from `logits`, reusing cached scalars.
     pub fn sample(&mut self, logits: &Array) -> Result<Array, Error> {
         if matches!(self.sampler, Sampler::Greedy) {
@@ -121,6 +150,24 @@ impl SamplerState {
         let token = take_along_axis(&order, &pick, -1)?;
         Ok(token.squeeze_axes(&[-1])?)
     }
+}
+
+/// Temperature-scaled, optionally top-p-masked log-probabilities.
+/// `keep_mask` (when present) sets excluded ids to `-inf` before the
+/// log-softmax, so they get `-inf` log-prob.
+pub(crate) fn masked_temp_log_probs(
+    logits: &Array,
+    keep_mask: Option<&Array>,
+    inv_temp: &Array,
+) -> Result<Array, Error> {
+    let scaled = multiply(logits, inv_temp)?;
+    let masked = if let Some(mask) = keep_mask {
+        let neg_inf = Array::from_f32(f32::NEG_INFINITY).as_dtype(scaled.dtype())?;
+        r#where(mask, &scaled, &neg_inf)?
+    } else {
+        scaled
+    };
+    Ok(log_softmax(&masked, -1)?)
 }
 
 #[cfg(test)]

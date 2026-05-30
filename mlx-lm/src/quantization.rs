@@ -1,25 +1,142 @@
 //! `quantization_config` parsing for MLX checkpoints.
+//!
+//! Two checkpoint shapes:
+//! - **Uniform:** `{group_size, bits, mode}` — every quantisable param
+//!   uses the body settings.
+//! - **Per-tensor overrides:** body settings plus path-keyed entries
+//!   like `"…layers.0.mlp.gate": {group_size, bits}`. Qwen3.6-MoE
+//!   ships the router + shared-expert gates at 8-bit even when the
+//!   body is 4-bit; loaders consult [`QuantizationConfig::for_path`].
+
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
-const DEFAULT_QUANT_MODE: &str = "affine";
+/// Quantisation mode from `quantization.mode`. Every production
+/// checkpoint ships `affine`; unknown values reject at deserialize.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantMode {
+    #[default]
+    Affine,
+}
 
-#[derive(Debug, Clone, Deserialize)]
+/// Body quantisation + optional per-key overrides.
+#[derive(Debug, Clone)]
 pub struct QuantizationConfig {
     pub group_size: i32,
     pub bits: i32,
-    #[serde(default = "default_quant_mode")]
-    pub mode: String,
+    pub mode: QuantMode,
+    /// Per-key overrides keyed by the raw safetensors prefix, e.g.
+    /// `language_model.model.layers.0.mlp.gate`.
+    pub overrides: HashMap<String, (i32, i32)>,
 }
 
-fn default_quant_mode() -> String {
-    DEFAULT_QUANT_MODE.to_string()
+impl QuantizationConfig {
+    /// `(group_size, bits)` for `path` — its override if any, else the
+    /// body defaults.
+    pub fn for_path(&self, path: &str) -> (i32, i32) {
+        self.overrides
+            .get(path)
+            .copied()
+            .unwrap_or((self.group_size, self.bits))
+    }
 }
 
-/// Prefer `quantization`; fall back to legacy `quantization_config`.
-pub fn resolve_quantization<'a>(
-    primary: &'a Option<QuantizationConfig>,
-    legacy: &'a Option<QuantizationConfig>,
-) -> Option<&'a QuantizationConfig> {
-    primary.as_ref().or(legacy.as_ref())
+/// Body knobs deserialize directly; every other entry flows into
+/// `extras` so per-key override objects fall out of the residual.
+#[derive(Deserialize)]
+struct Raw {
+    group_size: i32,
+    bits: i32,
+    #[serde(default)]
+    mode: QuantMode,
+    #[serde(flatten)]
+    extras: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct OverrideValue {
+    group_size: i32,
+    bits: i32,
+}
+
+impl<'de> Deserialize<'de> for QuantizationConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = Raw::deserialize(d)?;
+        let mut overrides = HashMap::with_capacity(raw.extras.len());
+        for (k, v) in raw.extras {
+            // Non-object entries are advisory fields transformers may
+            // emit — skip. An object is meant to be an override, so a
+            // strict-parse failure is an error, not a silent body-bits
+            // fallback.
+            if v.is_object() {
+                let ov: OverrideValue =
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+                overrides.insert(k, (ov.group_size, ov.bits));
+            }
+        }
+        Ok(Self {
+            group_size: raw.group_size,
+            bits: raw.bits,
+            mode: raw.mode,
+            overrides,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test code")]
+    use super::*;
+
+    #[test]
+    fn parses_uniform_config() {
+        let q: QuantizationConfig =
+            serde_json::from_str(r#"{"group_size": 64, "bits": 8, "mode": "affine"}"#).unwrap();
+        assert_eq!((q.group_size, q.bits), (64, 8));
+        assert_eq!(q.mode, QuantMode::Affine);
+        assert!(q.overrides.is_empty());
+        assert_eq!(q.for_path("anything"), (64, 8));
+    }
+
+    #[test]
+    fn parses_per_tensor_overrides() {
+        let q: QuantizationConfig = serde_json::from_str(
+            r#"{
+                "group_size": 64,
+                "bits": 4,
+                "mode": "affine",
+                "language_model.model.layers.0.mlp.gate": {"group_size": 64, "bits": 8}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(q.bits, 4);
+        assert_eq!(q.overrides.len(), 1);
+        assert_eq!(
+            q.for_path("language_model.model.layers.0.mlp.gate"),
+            (64, 8)
+        );
+        assert_eq!(
+            q.for_path("language_model.model.layers.0.self_attn.q_proj"),
+            (64, 4)
+        );
+    }
+
+    #[test]
+    fn default_mode_filled() {
+        let q: QuantizationConfig =
+            serde_json::from_str(r#"{"group_size": 32, "bits": 4}"#).unwrap();
+        assert_eq!(q.mode, QuantMode::Affine);
+    }
+
+    #[test]
+    fn malformed_override_object_errors() {
+        // Override object missing `group_size` must fail, not silently
+        // fall back to body bits.
+        let r = serde_json::from_str::<QuantizationConfig>(
+            r#"{"group_size": 64, "bits": 4, "model.layers.0.mlp.gate": {"bits": 8}}"#,
+        );
+        assert!(r.is_err());
+    }
 }

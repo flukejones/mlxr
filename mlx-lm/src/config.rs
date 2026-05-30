@@ -65,6 +65,12 @@ pub enum Family {
         alias = "qwen3_5forconditionalgeneration"
     )]
     Qwen35(qwen35::ModelConfig),
+    #[serde(
+        rename = "qwen3_5_moe",
+        alias = "qwen3_5_moe_text",
+        alias = "qwen3_next"
+    )]
+    Qwen35Moe(qwen35::ModelConfig),
 }
 
 impl Family {
@@ -74,6 +80,7 @@ impl Family {
             Self::Llama(_) => "llama",
             Self::Qwen3(_) => "qwen3",
             Self::Qwen35(_) => "qwen3_5",
+            Self::Qwen35Moe(_) => "qwen3_5_moe",
         }
     }
 
@@ -93,7 +100,7 @@ impl Family {
 
     pub fn as_qwen35(&self) -> Option<&qwen35::ModelConfig> {
         match self {
-            Self::Qwen35(env) => Some(env),
+            Self::Qwen35(env) | Self::Qwen35Moe(env) => Some(env),
             _ => None,
         }
     }

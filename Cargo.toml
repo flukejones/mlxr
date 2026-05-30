@@ -40,6 +40,7 @@ mlx-lm = { version = "0.0.1", path = "mlx-lm" }
 mlx-lm-utils = { version = "0.0.1", path = "mlx-lm-utils" }
 
 # external dependencies
+log = "0.4"
 thiserror = "2"
 float_eq = "1"
 pretty_assertions = "1.4.0"

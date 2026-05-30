@@ -2,12 +2,15 @@
 //! linear-attention path, caches, decoder stack, weights, dense adapter.
 
 pub mod adapter_dense;
+pub mod adapter_moe;
 pub mod cache;
 pub mod config;
 pub mod gated_delta;
 pub mod gated_delta_block;
 pub mod layer;
+pub mod moe;
 pub mod rope;
+pub mod sampling;
 #[allow(
     clippy::module_inception,
     reason = "text-family core types live in text.rs"

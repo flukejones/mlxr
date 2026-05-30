@@ -11,6 +11,7 @@ use crate::error::Error;
 use crate::llama::text::config as llama;
 use crate::quantization::QuantizationConfig;
 use crate::qwen3::text::config as qwen3;
+use crate::qwen3_5::text::config as qwen35;
 
 /// Parsed `config.json` for any supported family.
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +59,12 @@ pub enum Family {
     Llama(llama::ModelArgs),
     #[serde(rename = "qwen3")]
     Qwen3(qwen3::ModelArgs),
+    #[serde(
+        rename = "qwen3_5",
+        alias = "qwen3_5_text",
+        alias = "qwen3_5forconditionalgeneration"
+    )]
+    Qwen35(qwen35::ModelConfig),
 }
 
 impl Family {
@@ -66,20 +73,28 @@ impl Family {
         match self {
             Self::Llama(_) => "llama",
             Self::Qwen3(_) => "qwen3",
+            Self::Qwen35(_) => "qwen3_5",
         }
     }
 
     pub fn as_llama(&self) -> Option<&llama::ModelArgs> {
         match self {
             Self::Llama(args) => Some(args),
-            Self::Qwen3(_) => None,
+            _ => None,
         }
     }
 
     pub fn as_qwen3(&self) -> Option<&qwen3::ModelArgs> {
         match self {
             Self::Qwen3(args) => Some(args),
-            Self::Llama(_) => None,
+            _ => None,
+        }
+    }
+
+    pub fn as_qwen35(&self) -> Option<&qwen35::ModelConfig> {
+        match self {
+            Self::Qwen35(env) => Some(env),
+            _ => None,
         }
     }
 }

@@ -1,3 +1,4 @@
+pub mod activations;
 pub mod cache;
 pub mod chat_template;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod model_context;
 pub mod nn;
 pub mod quantization;
 pub mod qwen3;
+pub mod qwen3_5;
 pub mod sampler;
 pub mod user_input;
 pub mod utils;

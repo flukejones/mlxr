@@ -16,7 +16,7 @@ use crate::language_model::{LanguageModel, UserInputProcessor};
 use crate::lm_input::{LMInput, PrepareResult, Text};
 use crate::sampler::{Sampler, SamplerState};
 use crate::user_input::UserInput;
-use crate::{llama, qwen3};
+use crate::{llama, qwen3, qwen3_5};
 
 /// Sampling + stopping knobs handed to [`generate`].
 #[derive(Debug, Clone)]
@@ -103,6 +103,7 @@ fn dispatch_load(cfg: &ModelConfig, dir: &Path) -> Result<LoadedContext, Error> 
     match &cfg.family {
         Family::Llama(_) => llama::load_context(cfg, dir),
         Family::Qwen3(_) => qwen3::load_context(cfg, dir),
+        Family::Qwen35(_) => qwen3_5::load_context(cfg, dir),
     }
 }
 

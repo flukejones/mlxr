@@ -1,5 +1,5 @@
-//! Llama [`LanguageModel`] adapter: wraps the [`crate::models::llama`]
-//! graph + its KV cache behind the family-agnostic runtime trait.
+//! Llama [`LanguageModel`] adapter: wraps the llama model graph + its
+//! KV cache behind the family-agnostic runtime trait.
 
 use std::path::Path;
 
@@ -7,12 +7,13 @@ use mlx_rs::{module::Module, ops::indexing::IndexOp, Array};
 
 use crate::cache::KVCache;
 use crate::chat_template::ChatTemplate;
-use crate::config::{Family, ModelConfig};
+use crate::config::ModelConfig;
 use crate::error::Error;
 use crate::family::{EosSpec, LoadedContext};
 use crate::language_model::{LanguageModel, TextOnlyProcessor};
+use crate::llama::text::config::ModelArgs;
+use crate::llama::text::model::{load_llama_model, load_llama_tokenizer, Model};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
-use crate::models::llama::{load_llama_model, load_llama_tokenizer, Model};
 use crate::nn::ModelInput;
 
 struct LlamaAdapter {
@@ -53,11 +54,11 @@ impl LanguageModel for LlamaAdapter {
     }
 }
 
-pub fn load_context(dir: &Path) -> Result<LoadedContext, Error> {
-    let cfg = ModelConfig::from_dir(dir)?;
-    let Family::Llama(args) = &cfg.family else {
-        return Err(Error::config("config.json model_type is not llama"));
-    };
+pub(crate) fn load_context(
+    _cfg: &ModelConfig,
+    args: &ModelArgs,
+    dir: &Path,
+) -> Result<LoadedContext, Error> {
     let vocab_size = args.vocab_size;
     let eos_ids = EosSpec::to_vec(args.eos_token_id.as_ref());
 

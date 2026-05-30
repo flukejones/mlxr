@@ -98,8 +98,8 @@ pub fn load(dir: impl AsRef<Path>) -> Result<ModelContext, Error> {
 /// compare reaches runtime; serde picked the variant at parse.
 fn dispatch_load(cfg: &ModelConfig, dir: &Path) -> Result<LoadedContext, Error> {
     match &cfg.family {
-        Family::Llama(_) => llama::load_context(dir),
-        Family::Qwen3(_) => qwen3::load_context(dir),
+        Family::Llama(_) => llama::load_context(cfg, dir),
+        Family::Qwen3(_) => qwen3::load_context(cfg, dir),
     }
 }
 

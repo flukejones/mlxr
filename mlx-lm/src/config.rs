@@ -8,8 +8,9 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::models::{llama, qwen3};
+use crate::llama::text::config as llama;
 use crate::quantization::QuantizationConfig;
+use crate::qwen3::text::config as qwen3;
 
 /// Parsed `config.json` for any supported family.
 #[derive(Debug, Clone, Deserialize)]
@@ -57,4 +58,28 @@ pub enum Family {
     Llama(llama::ModelArgs),
     #[serde(rename = "qwen3")]
     Qwen3(qwen3::ModelArgs),
+}
+
+impl Family {
+    /// Canonical `model_type` string.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Llama(_) => "llama",
+            Self::Qwen3(_) => "qwen3",
+        }
+    }
+
+    pub fn as_llama(&self) -> Option<&llama::ModelArgs> {
+        match self {
+            Self::Llama(args) => Some(args),
+            Self::Qwen3(_) => None,
+        }
+    }
+
+    pub fn as_qwen3(&self) -> Option<&qwen3::ModelArgs> {
+        match self {
+            Self::Qwen3(args) => Some(args),
+            Self::Llama(_) => None,
+        }
+    }
 }

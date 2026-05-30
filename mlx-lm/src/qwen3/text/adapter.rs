@@ -1,5 +1,5 @@
-//! Qwen3 [`LanguageModel`] adapter: wraps the [`crate::models::qwen3`]
-//! graph + its KV cache behind the family-agnostic runtime trait.
+//! Qwen3 [`LanguageModel`] adapter: wraps the qwen3 model graph + its
+//! KV cache behind the family-agnostic runtime trait.
 
 use std::path::Path;
 
@@ -7,13 +7,14 @@ use mlx_rs::{module::Module, ops::indexing::IndexOp, Array};
 
 use crate::cache::KVCache;
 use crate::chat_template::ChatTemplate;
-use crate::config::{Family, ModelConfig};
+use crate::config::ModelConfig;
 use crate::error::Error;
 use crate::family::{EosSpec, LoadedContext};
 use crate::language_model::{LanguageModel, TextOnlyProcessor};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
-use crate::models::qwen3::{load_qwen3_model, load_qwen3_tokenizer, Model};
 use crate::nn::ModelInput;
+use crate::qwen3::text::config::ModelArgs;
+use crate::qwen3::text::model::{load_qwen3_model, load_qwen3_tokenizer, Model};
 
 struct Qwen3Adapter {
     model: Model,
@@ -53,11 +54,11 @@ impl LanguageModel for Qwen3Adapter {
     }
 }
 
-pub fn load_context(dir: &Path) -> Result<LoadedContext, Error> {
-    let cfg = ModelConfig::from_dir(dir)?;
-    let Family::Qwen3(args) = &cfg.family else {
-        return Err(Error::config("config.json model_type is not qwen3"));
-    };
+pub(crate) fn load_context(
+    _cfg: &ModelConfig,
+    args: &ModelArgs,
+    dir: &Path,
+) -> Result<LoadedContext, Error> {
     let vocab_size = args.vocab_size;
     let eos_ids = EosSpec::to_vec(args.eos_token_id.as_ref());
 

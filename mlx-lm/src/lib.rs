@@ -8,7 +8,6 @@ pub mod llama;
 pub mod lm_input;
 pub mod loader;
 pub mod model_context;
-pub mod models;
 pub mod nn;
 pub mod quantization;
 pub mod qwen3;

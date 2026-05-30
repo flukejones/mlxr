@@ -10,9 +10,11 @@
 //! [`crate::model_context::ModelContext`] holds one of each and
 //! [`crate::model_context::generate`] drives them.
 
+use crate::cache::CacheOptions;
 use crate::chat_template::ChatTemplate;
 use crate::error::Error;
 use crate::lm_input::{LMInput, LMOutput, PrepareResult, Text};
+use crate::sampler::SamplerState;
 use crate::user_input::{Prompt, UserInput};
 
 /// Turn a [`UserInput`] into an [`LMInput`]. One impl per family — the
@@ -47,6 +49,44 @@ pub trait LanguageModel: Send {
 
     /// Text vocab size, used to validate sampled ids.
     fn vocab_size(&self) -> i32;
+
+    /// Prompt tokens the cache holds per forward. `Some(W)` triggers
+    /// chunked prefill; `None` = unbounded.
+    fn prefill_chunk_size(&self) -> Option<i32> {
+        None
+    }
+
+    /// Ingest one prefill chunk, advance the cache, drop logits. Only
+    /// called when `prefill_chunk_size` is `Some`.
+    fn prefill_chunk(&mut self, _tokens: &mlx_rs::Array) -> Result<(), Error> {
+        Err(Error::Other(
+            "prefill_chunk called on a model with no prefill_chunk_size override".into(),
+        ))
+    }
+
+    /// True iff an MTP head is loaded.
+    fn has_mtp(&self) -> bool {
+        false
+    }
+
+    /// MTP step: committed token ids + next pending token. `None` =
+    /// no MTP head. Greedy accepts-if-equal; sampled uses rejection.
+    fn try_mtp_decode(
+        &mut self,
+        _last_token: &mlx_rs::Array,
+        _sampler: &mut SamplerState,
+    ) -> Result<Option<(Vec<u32>, mlx_rs::Array)>, Error> {
+        Ok(None)
+    }
+
+    /// MTP draft depth. No-op without an MTP head.
+    fn set_mtp_depth(&mut self, _n: u32) {}
+
+    /// Pick the cache backing; rebuilds the per-layer vec. Call after
+    /// load, before first turn.
+    fn set_cache_options(&mut self, _options: CacheOptions) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Text-only processor: renders the chat template + tokenises. Each

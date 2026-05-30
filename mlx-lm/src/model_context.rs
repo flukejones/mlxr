@@ -7,13 +7,13 @@
 use std::ops::ControlFlow;
 use std::path::Path;
 
-use mlx_rs::{memory::clear_cache, transforms::async_eval, Array};
+use mlx_rs::{memory::clear_cache, ops::indexing::IndexOp, transforms::async_eval, Array};
 
 use crate::config::{Family, ModelConfig};
 use crate::error::Error;
 use crate::family::LoadedContext;
 use crate::language_model::{LanguageModel, UserInputProcessor};
-use crate::lm_input::{LMInput, PrepareResult};
+use crate::lm_input::{LMInput, PrepareResult, Text};
 use crate::sampler::{Sampler, SamplerState};
 use crate::user_input::UserInput;
 use crate::{llama, qwen3};
@@ -27,6 +27,8 @@ pub struct GenerateParams {
     pub sampling: Sampler,
     /// Stop tokens beyond the model-default EOS list.
     pub extra_stop_ids: Vec<u32>,
+    /// Force the non-MTP path even on MTP models (parity A/B).
+    pub disable_mtp: bool,
 }
 
 impl Default for GenerateParams {
@@ -35,6 +37,7 @@ impl Default for GenerateParams {
             max_new_tokens: 256,
             sampling: Sampler::default(),
             extra_stop_ids: Vec::new(),
+            disable_mtp: false,
         }
     }
 }
@@ -212,28 +215,45 @@ pub fn generate(
     let mut pending_id = sampler.sample(&initial_logits)?;
     async_eval([&pending_id])?;
 
-    for _ in 0..params.max_new_tokens {
-        // Submit N+1 before syncing on N — overlap the host
-        // coherence sync with N+1 GPU compute.
-        let next_pending = decode_step(ctx.model.as_mut(), &mut sampler, &pending_id)?;
+    // MTP runs on MTP models unless disabled. Greedy + MTP is
+    // byte-identical to greedy; sampled MTP uses rejection sampling.
+    let use_mtp = ctx.model.has_mtp() && !params.disable_mtp;
 
-        let id_i32 = pending_id.item::<i32>();
-        if id_i32 < 0 || id_i32 >= vocab {
-            return Err(Error::shape(format!(
-                "sampler returned out-of-vocab id {id_i32} (vocab = {vocab})"
-            )));
-        }
-        let token = id_i32 as u32;
-        pending_id = next_pending;
+    if use_mtp {
+        run_mtp_loop(
+            ctx,
+            pending_id,
+            &params,
+            &mut sampler,
+            &mut decoder,
+            &mut finish_reason,
+            on_token,
+            vocab,
+        )?;
+    } else {
+        for _ in 0..params.max_new_tokens {
+            // Submit N+1 before syncing on N — overlap the host
+            // coherence sync with N+1 GPU compute.
+            let next_pending = decode_step(ctx.model.as_mut(), &mut sampler, &pending_id)?;
 
-        if ctx.eos_ids.contains(&token) || params.extra_stop_ids.contains(&token) {
-            finish_reason = FinishReason::Stop;
-            break;
-        }
+            let id_i32 = pending_id.item::<i32>();
+            if id_i32 < 0 || id_i32 >= vocab {
+                return Err(Error::shape(format!(
+                    "sampler returned out-of-vocab id {id_i32} (vocab = {vocab})"
+                )));
+            }
+            let token = id_i32 as u32;
+            pending_id = next_pending;
 
-        let delta = decoder.push(token, ctx.processor.as_ref())?;
-        if matches!(on_token(token, &delta), ControlFlow::Break(())) {
-            break;
+            if ctx.eos_ids.contains(&token) || params.extra_stop_ids.contains(&token) {
+                finish_reason = FinishReason::Stop;
+                break;
+            }
+
+            let delta = decoder.push(token, ctx.processor.as_ref())?;
+            if matches!(on_token(token, &delta), ControlFlow::Break(())) {
+                break;
+            }
         }
     }
 
@@ -246,9 +266,79 @@ pub fn generate(
     })
 }
 
-/// Run prefill: ingest the prompt, return the next-token logits
-/// (or prime then `step` if the model defers logits).
-fn run_prefill(model: &mut dyn LanguageModel, input: LMInput) -> Result<Array, Error> {
+/// MTP self-speculative loop. `try_mtp_decode` commits 1–2 tokens per
+/// call and returns the next pending token.
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_loop(
+    ctx: &mut ModelContext,
+    initial_pending: Array,
+    params: &GenerateParams,
+    sampler: &mut SamplerState,
+    decoder: &mut IncrementalDecoder,
+    finish_reason: &mut FinishReason,
+    on_token: &mut TokenCallback<'_>,
+    vocab: i32,
+) -> Result<(), Error> {
+    let mut pending = initial_pending;
+    let mut budget = params.max_new_tokens;
+    while budget > 0 {
+        let (tokens, next_pending) = ctx
+            .model
+            .try_mtp_decode(&pending, sampler)?
+            .ok_or_else(|| Error::config("MTP loop on a model that no longer reports has_mtp"))?;
+        if tokens.is_empty() {
+            return Err(Error::config("MTP returned zero tokens"));
+        }
+        pending = next_pending;
+        for token in tokens.iter().copied() {
+            if token >= vocab as u32 {
+                return Err(Error::shape(format!(
+                    "MTP returned out-of-vocab id {token} (vocab = {vocab})"
+                )));
+            }
+            if ctx.eos_ids.contains(&token) || params.extra_stop_ids.contains(&token) {
+                *finish_reason = FinishReason::Stop;
+                return Ok(());
+            }
+            let delta = decoder.push(token, ctx.processor.as_ref())?;
+            if matches!(on_token(token, &delta), ControlFlow::Break(())) {
+                return Ok(());
+            }
+            budget -= 1;
+            if budget == 0 {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run prefill: ingest the prompt, return the next-token logits (or
+/// prime then `step` if the model defers logits). Prompts longer than
+/// `prefill_chunk_size` feed all-but-last chunk through `prefill_chunk`.
+fn run_prefill(model: &mut dyn LanguageModel, mut input: LMInput) -> Result<Array, Error> {
+    let prompt_len = input.text.tokens.shape()[1];
+    if let Some(window) = model.prefill_chunk_size() {
+        if prompt_len > window {
+            let tokens = input.text.tokens;
+            let mut start = 0_i32;
+            while prompt_len - start > window {
+                let end = start + window;
+                model.prefill_chunk(&tokens.index((.., start..end)))?;
+                start = end;
+            }
+            let tail = tokens.index((.., start..prompt_len));
+            let mask = input
+                .text
+                .mask
+                .as_ref()
+                .map(|m| m.index((.., start..prompt_len)));
+            input = LMInput {
+                text: Text { tokens: tail, mask },
+            };
+        }
+    }
+
     match model.prepare(input)? {
         PrepareResult::Logits(arr) => Ok(arr),
         PrepareResult::Primed => {

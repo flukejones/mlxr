@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     error::Exception,
-    transforms::compile::{shape, type_id_to_usize, CompiledState},
+    transforms::compile::{next_compile_id, shape, CompiledState},
     utils::Updatable,
     Array,
 };
@@ -61,7 +61,7 @@ where
     type Output = Compiled<F, F, shape::ArraySlice>;
 
     fn compile(self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         Compiled {
             shape: PhantomData,
             f_marker: PhantomData,
@@ -92,7 +92,7 @@ where
     type Output = Compiled<F, StateBoxedSliceFn<U>, shape::OneArg>;
 
     fn compile(mut self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         let f: StateBoxedSliceFn<U> =
             Box::new(move |state: &mut U, args: &[Array]| vec![(self)(state, &args[0])]);
         Compiled {
@@ -117,7 +117,7 @@ where
     type Output = Compiled<F, StateBoxedSliceFn<U>, shape::TwoArgs>;
 
     fn compile(mut self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         let f: StateBoxedSliceFn<U> = Box::new(move |state: &mut U, args: &[Array]| {
             vec![(self)(state, (&args[0], &args[1]))]
         });
@@ -143,7 +143,7 @@ where
     type Output = Compiled<F, StateBoxedSliceFn<U>, shape::ThreeArgs>;
 
     fn compile(mut self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         let f: StateBoxedSliceFn<U> = Box::new(move |state: &mut U, args: &[Array]| {
             vec![(self)(state, (&args[0], &args[1], &args[2]))]
         });
@@ -169,7 +169,7 @@ where
     type Output = Compiled<F, F, shape::ArraySlice>;
 
     fn compile(self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         Compiled {
             shape: PhantomData,
             f_marker: PhantomData,
@@ -192,7 +192,7 @@ where
     type Output = Compiled<F, StateBoxedSliceTryFn<U>, shape::OneArg>;
 
     fn compile(mut self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         let f: StateBoxedSliceTryFn<U> =
             Box::new(move |state: &mut U, args: &[Array]| Ok(vec![(self)(state, &args[0])?]));
         Compiled {
@@ -217,7 +217,7 @@ where
     type Output = Compiled<F, StateBoxedSliceTryFn<U>, shape::TwoArgs>;
 
     fn compile(mut self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         let f: StateBoxedSliceTryFn<U> = Box::new(move |state: &mut U, args: &[Array]| {
             Ok(vec![(self)(state, (&args[0], &args[1]))?])
         });
@@ -243,7 +243,7 @@ where
     type Output = Compiled<F, StateBoxedSliceTryFn<U>, shape::ThreeArgs>;
 
     fn compile(mut self, shapeless: bool) -> Self::Output {
-        let id = type_id_to_usize(&self);
+        let id = next_compile_id();
         let f: StateBoxedSliceTryFn<U> = Box::new(move |state: &mut U, args: &[Array]| {
             Ok(vec![(self)(state, (&args[0], &args[1], &args[2]))?])
         });

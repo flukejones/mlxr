@@ -142,9 +142,6 @@
 //! See mlx-rs/mlx-tests/tests/test_compile_with_state.rs for more examples.
 //!
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use super::{Closure, Guarded, VectorArray};
 use crate::Array;
 
@@ -219,14 +216,29 @@ impl<F> Drop for CompiledState<F> {
     }
 }
 
-fn type_id_to_usize<T>(_val: &T) -> usize
-where
-    T: 'static,
-{
-    let type_id = std::any::TypeId::of::<T>();
-    let mut hasher = DefaultHasher::new();
-    type_id.hash(&mut hasher);
-    hasher.finish() as usize
+/// Allocate a unique id for a freshly-built [`Compiled`] state.
+///
+/// **Why this is not derived from `TypeId::of::<T>()`**: two distinct
+/// `fn` pointers cast to the same concrete signature share one `TypeId`.
+/// Keying `mlx_detail_compile` on the type id makes the second
+/// `compile()` call silently reuse the first function's compiled graph —
+/// e.g. a `swiglu` warming the slot then an `attention_gate` of the same
+/// `(&Array, &Array)` signature returning `sigmoid(output) * gate`
+/// instead of `sigmoid(gate) * output`. Process-wide monotonic ids give
+/// one compiled-graph slot per call regardless of source type.
+fn next_compile_id() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Bump the global compile-id counter once and reuse the returned id, so
+/// many callers of the same logical operation share one compiled-graph
+/// slot in MLX's `compiler_cache` instead of each burning a fresh JIT
+/// compile. Stash it in a `OnceLock<usize>` keyed to the operation and
+/// pass it to [`compile::Compile::compile_with_id`] from every cache init.
+pub fn allocate_compile_id() -> usize {
+    next_compile_id()
 }
 
 fn update_by_replace_with_ref_to_new_array(src: &mut Array, new_array: &Array) {

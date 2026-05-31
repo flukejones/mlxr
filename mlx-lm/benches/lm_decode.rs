@@ -1,5 +1,7 @@
-//! Decode-throughput bench for llama + qwen3. See `BENCHMARK.md`.
+//! Decode-throughput bench for llama + qwen3 + qwen3.5 (GDN-hybrid dense
+//! + MoE, with an MTP-on/off A/B cell). See `BENCHMARK.md`.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -7,7 +9,7 @@ use std::time::{Duration, Instant};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mlx_lm::lm_input::{LMInput, Text};
 use mlx_lm::sampler::{Sampler, SamplerState};
-use mlx_lm::{decode_step, load, ModelContext};
+use mlx_lm::{decode_step, generate, load, GenerateParams, ModelContext, UserInput};
 use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
     transforms::eval,
@@ -191,6 +193,81 @@ fn time_decode(ctx: &mut ModelContext, prompt: &Array, steps: i32) -> Duration {
     Instant::now() - t_start
 }
 
+/// MTP self-speculative A/B: time a fixed-length `generate` with MTP on
+/// vs off on the same checkpoint. Throughput is keyed on actually-emitted
+/// tokens (MTP commits a variable count per call), so the two cells are
+/// directly comparable tok/s. Sampling is top-p (temp > 0) so the MTP
+/// path exercises the Leviathan rejection branch, not the greedy
+/// shortcut; on/off outputs differ (stochastic) — this measures speed,
+/// not parity (parity is the e2e greedy test's job).
+fn maybe_bench_mtp(c: &mut Criterion, label: &str, repo_id: &str) {
+    let group_name = format!("qwen3_5_moe_mtp_{label}");
+    if bench_only_skip(&group_name) {
+        return;
+    }
+    let Some(dir) = ensure_model(repo_id) else {
+        return;
+    };
+    let mut ctx = match load(&dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping {group_name}: load failed: {e:?}");
+            return;
+        }
+    };
+    if !ctx.model.has_mtp() {
+        eprintln!("skipping {group_name}: checkpoint has no MTP head");
+        return;
+    }
+
+    const PROMPT: &str = "Summarize the history of the city of Paris in detail.";
+    let params = |disable_mtp: bool| GenerateParams {
+        max_new_tokens: DECODE_TOKENS,
+        sampling: Sampler::TopP {
+            temperature: DECODE_TEMP,
+            p: 0.95,
+        },
+        disable_mtp,
+        ..Default::default()
+    };
+    let run = |ctx: &mut ModelContext, disable_mtp: bool| -> Duration {
+        let t = Instant::now();
+        let out = generate(
+            ctx,
+            UserInput::text(PROMPT),
+            params(disable_mtp),
+            &mut |_, _| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        // Guard against a zero-token result skewing throughput.
+        debug_assert!(out.completion_tokens > 0);
+        Instant::now() - t
+    };
+
+    // Warm kernel/compile caches outside the timing window.
+    let _ = run(&mut ctx, false);
+
+    let mut group = c.benchmark_group(&group_name);
+    group.sample_size(SAMPLE_SIZE);
+    group.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
+    group.throughput(Throughput::Elements(DECODE_TOKENS as u64));
+    for (id, disable_mtp) in [
+        (BenchmarkId::new("mtp_on", DECODE_TOKENS), false),
+        (BenchmarkId::new("mtp_off", DECODE_TOKENS), true),
+    ] {
+        group.bench_function(id, |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += run(&mut ctx, disable_mtp);
+                }
+                total
+            });
+        });
+    }
+    group.finish();
+}
+
 fn maybe_bench(c: &mut Criterion, family: &str, label: &str, repo_id: &str) {
     let group_name = format!("{family}_decode_{label}");
     if bench_only_skip(&group_name) {
@@ -324,6 +401,29 @@ fn bench_decode(c: &mut Criterion) {
             "large_q4",
             "mlx-community/Llama-3.2-3B-Instruct-4bit",
         );
+
+        // qwen3.5 GDN-hybrid dense + MoE — the new perf-sensitive paths
+        // (GDN scan kernel, gather_qmm experts, MTP). Heavy models, so
+        // Full-set only; each self-skips when its checkpoint is absent.
+        maybe_bench(
+            c,
+            "qwen3_5",
+            "dense_q8",
+            "mlx-community/Qwen3.5-4B-MLX-8bit",
+        );
+        maybe_bench(
+            c,
+            "qwen3_5",
+            "dense_q4",
+            "mlx-community/Qwen3.5-4B-MLX-4bit",
+        );
+        maybe_bench(
+            c,
+            "qwen3_5_moe",
+            "a3b_q8",
+            "mlx-community/Qwen3.6-35B-A3B-q8-mtp",
+        );
+        maybe_bench_mtp(c, "a3b_q8", "mlx-community/Qwen3.6-35B-A3B-q8-mtp");
     }
 }
 

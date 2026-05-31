@@ -21,11 +21,16 @@ fn greedy_token_ids(disable_mtp: bool, max_new_tokens: i32) -> (Vec<u32>, String
     };
     let mut ids = Vec::new();
     let mut text = String::new();
-    generate(&mut ctx, UserInput::text(PROMPT), params, &mut |id, delta| {
-        ids.push(id);
-        text.push_str(delta);
-        ControlFlow::Continue(())
-    })
+    generate(
+        &mut ctx,
+        UserInput::text(PROMPT),
+        params,
+        &mut |id, delta| {
+            ids.push(id);
+            text.push_str(delta);
+            ControlFlow::Continue(())
+        },
+    )
     .expect("generate");
     (ids, text)
 }

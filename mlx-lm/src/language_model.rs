@@ -132,6 +132,8 @@ impl UserInputProcessor for TextOnlyProcessor {
         let tokens = mlx_rs::Array::from_slice(&ids, &[1, len]);
         Ok(LMInput {
             text: Text { tokens, mask: None },
+            #[cfg(feature = "image")]
+            image: None,
         })
     }
 

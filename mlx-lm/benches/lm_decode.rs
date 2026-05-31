@@ -147,6 +147,8 @@ fn lm_input(prompt: &Array) -> LMInput {
             tokens: prompt.clone(),
             mask: None,
         },
+        #[cfg(feature = "image")]
+        image: None,
     }
 }
 

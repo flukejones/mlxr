@@ -8,9 +8,17 @@
 use mlx_rs::Array;
 
 /// Output of a [`crate::UserInputProcessor::prepare`] call.
+///
+/// `image` is independent of `text`: a VLM processor sets it to `Some`,
+/// a text-only request leaves it `None`. Gated on the `image` feature.
 #[derive(Debug)]
 pub struct LMInput {
     pub text: Text,
+
+    /// Pre-processed image tensor(s) for the vision tower. `None` for
+    /// text-only requests or models that don't accept images.
+    #[cfg(feature = "image")]
+    pub image: Option<ProcessedImage>,
 }
 
 /// Tokenised text portion of an [`LMInput`].
@@ -20,6 +28,21 @@ pub struct Text {
     pub tokens: Array,
     /// Optional `[1, S]` mask; `None` lets the model build its own.
     pub mask: Option<Array>,
+}
+
+/// Pre-processed image tensor(s), ready for the model's vision tower.
+/// The processor handles per-family normalisation, patch packing, and
+/// the temporal/height/width grid metadata.
+#[cfg(feature = "image")]
+#[derive(Debug)]
+pub struct ProcessedImage {
+    /// `[num_patches, feature_dim]` `f32` array. Patches are stacked
+    /// across all images in the prompt; `grids` records the per-image
+    /// `(t, h, w)` so the model can slice them apart.
+    pub pixels: Array,
+
+    /// One `[t, h, w]` patch-grid per image, in `UserInput::images` order.
+    pub grids: Vec<[i32; 3]>,
 }
 
 /// Result of [`crate::LanguageModel::prepare`]: logits to sample now, or

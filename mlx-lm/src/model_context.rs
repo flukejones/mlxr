@@ -336,6 +336,8 @@ fn run_prefill(model: &mut dyn LanguageModel, mut input: LMInput) -> Result<Arra
                 .map(|m| m.index((.., start..prompt_len)));
             input = LMInput {
                 text: Text { tokens: tail, mask },
+                #[cfg(feature = "image")]
+                image: None,
             };
         }
     }
@@ -370,6 +372,8 @@ mod tests {
                     tokens: Array::from_slice::<i32>(&[], &[1, 0]),
                     mask: None,
                 },
+                #[cfg(feature = "image")]
+                image: None,
             })
         }
         fn decode(&self, ids: &[u32]) -> Result<String, Error> {

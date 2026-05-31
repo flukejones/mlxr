@@ -18,10 +18,14 @@ pub mod user_input;
 pub mod utils;
 
 pub use language_model::{LanguageModel, TextOnlyProcessor, UserInputProcessor};
+#[cfg(feature = "image")]
+pub use lm_input::ProcessedImage;
 pub use lm_input::{LMInput, PrepareResult, Text};
 pub use model_context::{
     decode_step, generate, load, FinishReason, GenerateParams, GenerateResult, ModelContext,
     TokenCallback,
 };
 pub use sampler::{Sampler, SamplerState};
+#[cfg(feature = "image")]
+pub use user_input::Image;
 pub use user_input::{Prompt, UserInput};

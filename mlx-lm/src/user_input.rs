@@ -1,9 +1,14 @@
 //! Caller-facing input to [`crate::generate`].
 //!
-//! One struct carries the prompt (text or chat) plus template kwargs.
-//! Image/audio modalities are added with the families that consume them.
+//! One struct carries the prompt (text or chat) plus optional images
+//! (gated on the `image` feature) and template kwargs.
 
 use std::collections::HashMap;
+
+#[cfg(feature = "image")]
+use image::DynamicImage;
+#[cfg(feature = "image")]
+use mlx_rs::Array;
 
 use crate::chat_template::ChatMessage;
 
@@ -11,6 +16,11 @@ use crate::chat_template::ChatMessage;
 pub struct UserInput {
     /// What the user said: plain text or structured chat.
     pub prompt: Prompt,
+
+    /// Images attached to the conversation, in order. The chat-template
+    /// image slots consume them in sequence. Gated on `image`.
+    #[cfg(feature = "image")]
+    pub images: Vec<Image>,
 
     /// Named values forwarded to the chat-template render (e.g.
     /// `enable_thinking`). Empty by default.
@@ -29,6 +39,8 @@ impl UserInput {
     pub fn text(prompt: impl Into<String>) -> Self {
         Self {
             prompt: Prompt::Text(prompt.into()),
+            #[cfg(feature = "image")]
+            images: Vec::new(),
             template_kwargs: HashMap::new(),
         }
     }
@@ -37,8 +49,18 @@ impl UserInput {
     pub fn chat(messages: Vec<ChatMessage>) -> Self {
         Self {
             prompt: Prompt::Chat(messages),
+            #[cfg(feature = "image")]
+            images: Vec::new(),
             template_kwargs: HashMap::new(),
         }
+    }
+
+    /// Attach images, builder-style.
+    #[cfg(feature = "image")]
+    #[must_use]
+    pub fn with_images(mut self, images: Vec<Image>) -> Self {
+        self.images = images;
+        self
     }
 
     /// Set one template kwarg, builder-style.
@@ -47,6 +69,27 @@ impl UserInput {
         self.template_kwargs.insert(key.into(), value);
         self
     }
+}
+
+/// One image attached to a [`UserInput`].
+///
+/// - [`Image::Decoded`]: a CPU-decoded image; the processor resizes,
+///   normalises, and packs it into the tower's patch layout.
+/// - [`Image::Pixels`]: an already-preprocessed pixel array + its
+///   `[t, h, w]` grid; the processor validates geometry and feeds it
+///   straight to the tower (skips CPU preprocessing).
+#[cfg(feature = "image")]
+pub enum Image {
+    /// Raw decoded image. Processor resizes + normalises + packs.
+    Decoded(DynamicImage),
+
+    /// Already in the tower's pixel-array layout.
+    Pixels {
+        /// `[num_patches, feature_dim]` `f32` array.
+        array: Array,
+        /// `[t, h, w]` patch counts; product must equal `array.shape[0]`.
+        grid: [i32; 3],
+    },
 }
 
 #[cfg(test)]

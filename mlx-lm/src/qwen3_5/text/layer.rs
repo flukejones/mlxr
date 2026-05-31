@@ -466,22 +466,44 @@ where
         position_ids: Option<&Array>,
     ) -> Result<Array, Error> {
         Ok(self
-            .forward_pre_and_post_norm(inputs, caches, position_ids)?
+            .forward_pre_and_post_norm(inputs, None, caches, position_ids)?
+            .post_norm)
+    }
+
+    /// Multimodal forward over pre-stitched `[B, S, hidden]` embeddings
+    /// (image features already spliced in) with explicit mrope position
+    /// ids. The VLM prefill path's entry point.
+    #[cfg(feature = "image")]
+    pub fn forward_embeds(
+        &mut self,
+        inputs_embeds: Array,
+        caches: &mut [LayerCache],
+        position_ids: Option<&Array>,
+    ) -> Result<Array, Error> {
+        Ok(self
+            .forward_pre_and_post_norm(None, Some(inputs_embeds), caches, position_ids)?
             .post_norm)
     }
 
     /// Like [`Self::forward`] but returns the pre-final-norm hidden
     /// state alongside the post-norm one. The MTP head consumes
     /// `pre_norm` (it applies its own pre_fc_norm_hidden); the lm_head
-    /// projection uses `post_norm`.
+    /// projection uses `post_norm`. `inputs_embeds` (the VLM stitched
+    /// embeddings) is taken by value so it moves into `h` with no clone.
     pub fn forward_pre_and_post_norm(
         &mut self,
         inputs: Option<&Array>,
+        inputs_embeds: Option<Array>,
         caches: &mut [LayerCache],
         position_ids: Option<&Array>,
     ) -> Result<DecoderOutput, Error> {
-        let ids = inputs.ok_or_else(|| Error::config("Qwen35Decoder::forward: needs inputs"))?;
-        let mut h = self.embed_tokens.forward(ids)?;
+        let mut h = if let Some(e) = inputs_embeds {
+            e
+        } else {
+            let ids = inputs
+                .ok_or_else(|| Error::config("Qwen35Decoder::forward: needs inputs or embeds"))?;
+            self.embed_tokens.forward(ids)?
+        };
         if caches.len() != self.layers.len() {
             return Err(Error::shape(format!(
                 "Qwen35Decoder::forward: expected {} caches, got {}",
@@ -707,6 +729,22 @@ where
         Ok(logits)
     }
 
+    /// Multimodal forward over pre-stitched `[B, S, hidden]` embeddings
+    /// (image features already spliced in) with explicit mrope position
+    /// ids. Returns `[B, S, vocab]` logits. The VLM prefill entry point.
+    #[cfg(feature = "image")]
+    pub fn forward_embeds(
+        &mut self,
+        inputs_embeds: Array,
+        caches: &mut [LayerCache],
+        position_ids: Option<&Array>,
+    ) -> Result<Array, Error> {
+        let hidden = self
+            .model
+            .forward_embeds(inputs_embeds, caches, position_ids)?;
+        self.apply_lm_head(&hidden)
+    }
+
     /// Like [`Self::forward`] but also returns the post-final-norm
     /// hidden state over the full sequence. The MTP head consumes
     /// this post-norm hidden and applies its own `pre_fc_norm_hidden`
@@ -723,7 +761,7 @@ where
     ) -> Result<(Array, Array), Error> {
         let DecoderOutput { post_norm, .. } =
             self.model
-                .forward_pre_and_post_norm(inputs, caches, position_ids)?;
+                .forward_pre_and_post_norm(inputs, None, caches, position_ids)?;
         let logits = self.apply_lm_head(&post_norm)?;
         Ok((post_norm, logits))
     }

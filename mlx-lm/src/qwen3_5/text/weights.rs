@@ -3,6 +3,7 @@
 //! Key sanitiser:
 //!
 //! - `model.language_model.X` → `language_model.model.X`
+//! - `model.visual.X`         → `vision_tower.X`
 //! - `lm_head.X`              → `language_model.lm_head.X`
 //! - `conv1d.weight` whose last axis != 1 is normalised with
 //!   `moveaxis(2, 1)`.
@@ -74,6 +75,8 @@ fn sanitize_key(key: &str) -> String {
     // param-walk rewrite applies regardless of which prefix matched.
     let mut k = if key.contains("model.language_model") {
         key.replace("model.language_model", "language_model.model")
+    } else if key.contains("model.visual") {
+        key.replace("model.visual", "vision_tower")
     } else if let Some(rest) = key.strip_prefix("lm_head") {
         format!("language_model.lm_head{rest}")
     } else if let Some(rest) = key.strip_prefix("mtp.") {
@@ -97,12 +100,16 @@ fn strip_language_model_prefix(key: &str) -> &str {
     key.strip_prefix("language_model.").unwrap_or(key)
 }
 
-/// Bucket a sanitised key into the language-model param-path namespace
-/// (prefix stripped) or neither.
+/// Bucket a sanitised key into the language-model or vision-tower
+/// param-path namespace (prefix stripped), or neither.
 #[derive(Debug)]
 pub(crate) enum Bucketed {
     /// Routes to [`Qwen35Model`] under the returned path.
     Language(String),
+    /// Routes to the vision tower under the returned path. Consumed by the
+    /// VLM loader (`crate::qwen3_5::image::weights`); the text-only loaders
+    /// drop these.
+    Vision(String),
     /// Neither bucket — typically a `mtp.*` or unknown key that should be
     /// dropped or surfaced in the loader's `leftover` list.
     Other(String),
@@ -111,6 +118,9 @@ pub(crate) enum Bucketed {
 pub(crate) fn bucket_key(key: String) -> Bucketed {
     if let Some(rest) = key.strip_prefix("language_model.") {
         return Bucketed::Language(rest.to_owned());
+    }
+    if let Some(rest) = key.strip_prefix("vision_tower.") {
+        return Bucketed::Vision(rest.to_owned());
     }
     Bucketed::Other(key)
 }
@@ -224,6 +234,9 @@ pub(crate) fn load_language_model(
                         leftover.push(format!("language_model.{p}"));
                     }
                 }
+                // Text-only loader: a VL checkpoint's vision keys are
+                // surfaced as leftover (the VLM loader consumes them).
+                Bucketed::Vision(p) => leftover.push(format!("vision_tower.{p}")),
                 Bucketed::Other(p) => leftover.push(p),
             }
         }

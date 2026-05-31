@@ -103,7 +103,9 @@ fn dispatch_load(cfg: &ModelConfig, dir: &Path) -> Result<LoadedContext, Error> 
     match &cfg.family {
         Family::Llama(_) => llama::load_context(cfg, dir),
         Family::Qwen3(_) => qwen3::load_context(cfg, dir),
-        Family::Qwen35(_) | Family::Qwen35Moe(_) => qwen3_5::load_context(cfg, dir),
+        Family::Qwen35(_) | Family::Qwen35Moe(_) | Family::Qwen35Vl(_) => {
+            qwen3_5::load_context(cfg, dir)
+        }
     }
 }
 

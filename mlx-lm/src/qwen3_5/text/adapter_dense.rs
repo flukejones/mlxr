@@ -29,6 +29,15 @@ pub(crate) struct Qwen35DenseAdapter {
     pub(crate) cfg: ModelConfig,
     pub(crate) cache: Vec<LayerCache>,
     pub(crate) cache_options: CacheOptions,
+    /// Cumulative position (prompt + decoded tokens). Only the
+    /// multimodal `step` path reads it to build the `[3,1,1]` mrope
+    /// position id; pure text never touches it.
+    #[cfg(feature = "image")]
+    pub(crate) cursor: i32,
+    /// `Some` after a multimodal prefill: per-step decode position is
+    /// `cursor + rope_delta` broadcast across the three mrope axes.
+    #[cfg(feature = "image")]
+    pub(crate) rope_delta: Option<i32>,
     pub(crate) vocab_size: i32,
 }
 
@@ -42,14 +51,43 @@ impl Qwen35DenseAdapter {
             cfg,
             cache,
             cache_options,
+            #[cfg(feature = "image")]
+            cursor: 0,
+            #[cfg(feature = "image")]
+            rope_delta: None,
             vocab_size,
         })
+    }
+
+    /// Multimodal prefill seed: pre-stitched embeddings + `[3,1,S]` mrope
+    /// position ids + `rope_delta`. The VLM adapter is the only caller;
+    /// records `cursor`/`rope_delta` so the subsequent `step` calls keep
+    /// the rope advancing past the image block.
+    #[cfg(feature = "image")]
+    pub(crate) fn prefill_embeds(
+        &mut self,
+        inputs_embeds: Array,
+        position_ids: Array,
+        rope_delta: i32,
+    ) -> Result<Array, Error> {
+        let s = inputs_embeds.shape()[1];
+        let logits =
+            self.model
+                .forward_embeds(inputs_embeds, &mut self.cache, Some(&position_ids))?;
+        self.cursor = s;
+        self.rope_delta = Some(rope_delta);
+        Ok(logits.index((.., -1, ..)))
     }
 }
 
 impl LanguageModel for Qwen35DenseAdapter {
     fn reset(&mut self) {
         self.cache = make_caches(&self.cfg, self.cache_options);
+        #[cfg(feature = "image")]
+        {
+            self.cursor = 0;
+            self.rope_delta = None;
+        }
     }
 
     fn prepare(&mut self, input: LMInput) -> Result<PrepareResult, Error> {
@@ -57,12 +95,37 @@ impl LanguageModel for Qwen35DenseAdapter {
         let shape = tokens.shape();
         debug_assert_eq!(shape[0], 1, "batch dim must be 1");
         let logits = self.model.forward(Some(&tokens), &mut self.cache, None)?;
+        #[cfg(feature = "image")]
+        {
+            self.cursor = shape[1];
+            self.rope_delta = None;
+        }
         Ok(PrepareResult::Logits(logits.index((.., -1, ..))))
     }
 
     fn step(&mut self, last_token: &Array) -> Result<LMOutput, Error> {
         let inp = last_token.reshape(&[1, 1])?;
-        let logits = self.model.forward(Some(&inp), &mut self.cache, None)?;
+
+        // Multimodal decode needs an explicit `[3,1,1]` mrope position id so
+        // the rope keeps advancing past the image block; pure text leaves
+        // `rope_delta = None` and the model derives the position from the
+        // cache offset internally. Without the `image` feature there is no
+        // VLM path, so `pos` is always `None`.
+        #[cfg(feature = "image")]
+        let pos = self.rope_delta.map(|delta| {
+            let p = self.cursor + delta;
+            Array::from_slice(&[p, p, p], &[3, 1, 1])
+        });
+        #[cfg(not(feature = "image"))]
+        let pos: Option<Array> = None;
+
+        let logits = self
+            .model
+            .forward(Some(&inp), &mut self.cache, pos.as_ref())?;
+        #[cfg(feature = "image")]
+        {
+            self.cursor += 1;
+        }
         Ok(LMOutput {
             logits: logits.index((.., -1, ..)),
         })

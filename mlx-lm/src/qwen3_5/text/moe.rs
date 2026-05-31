@@ -245,6 +245,9 @@ pub(crate) fn load_qwen3_5_moe_model(
                         leftover.push(format!("language_model.{p}"));
                     }
                 }
+                // Text MoE loader drops any vision-tower keys (VL-MoE is
+                // out of scope; a VL checkpoint uses the dense VLM loader).
+                Bucketed::Vision(_) => {}
                 Bucketed::Other(p) => leftover.push(p),
             }
         }

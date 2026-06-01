@@ -14,6 +14,8 @@ use argh::FromArgs;
 use chat::think_stream::ThinkStream;
 use mlx_lm::cache::{CacheKind, CacheOptions, DEFAULT_KV_GROUP_SIZE};
 use mlx_lm::chat_template::ChatMessage;
+#[cfg(feature = "audio")]
+use mlx_lm::Audio;
 use mlx_lm::{generate, load, GenerateParams, Image, ModelContext, Sampler, UserInput};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -83,7 +85,13 @@ struct Args {
     #[argh(option)]
     image: Option<PathBuf>,
 
-    /// instruction sent alongside --image (default empty)
+    /// path to a 16 kHz mono WAV (audio models); one-shot with --prompt (needs
+    /// the `audio` feature)
+    #[cfg(feature = "audio")]
+    #[argh(option)]
+    audio: Option<PathBuf>,
+
+    /// instruction sent alongside --image/--audio (default empty)
     #[argh(option, default = "String::new()")]
     prompt: String,
 }
@@ -215,6 +223,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // One-shot audio path: --audio runs a single audio+prompt turn, then exits.
+    #[cfg(feature = "audio")]
+    if let Some(audio_path) = &args.audio {
+        let samples = load_wav_16k_mono(audio_path)?;
+        let msg = ChatMessage::user_with_audio(&args.prompt);
+        let input = apply_think(
+            UserInput::chat(vec![msg]).with_audio(vec![Audio { samples }]),
+            args.think,
+        );
+        run_turn(&mut ctx, input, build_params(&args))?;
+        println!();
+        return Ok(());
+    }
+
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut editor = DefaultEditor::new().context("rustyline init")?;
     eprintln!("[ready. /exit to quit. /reset to clear history.]");
@@ -254,6 +276,37 @@ fn main() -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// Decode a 16 kHz mono WAV to `f32` samples in `[-1, 1]`. Errors on any other
+/// sample rate or channel count — the caller pre-converts (e.g.
+/// `ffmpeg -ar 16000 -ac 1`).
+#[cfg(feature = "audio")]
+fn load_wav_16k_mono(path: &std::path::Path) -> Result<Vec<f32>> {
+    let reader = hound::WavReader::open(path).context("open wav")?;
+    let spec = reader.spec();
+    if spec.sample_rate != 16_000 || spec.channels != 1 {
+        anyhow::bail!(
+            "wav must be 16 kHz mono (got {} Hz, {} ch); convert with `ffmpeg -ar 16000 -ac 1`",
+            spec.sample_rate,
+            spec.channels
+        );
+    }
+    let mut reader = reader;
+    match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("read wav samples"),
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("read wav samples")
+        }
+    }
 }
 
 /// Apply the `--think` mode as the template's `enable_thinking` kwarg.

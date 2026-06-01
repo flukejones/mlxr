@@ -358,7 +358,7 @@ fn render_prompt(
                             .into_iter()
                             .filter_map(|p| match p {
                                 ContentPart::Text { text } => Some(text),
-                                ContentPart::Image => None,
+                                ContentPart::Image | ContentPart::Audio => None,
                             })
                             .collect::<Vec<_>>()
                             .join("\n"),

@@ -61,6 +61,8 @@ impl AudioConfig {
 pub const SUBSAMPLING_CONV_CHANNELS: [i32; 2] = [128, 32];
 /// Log-mel feature bins the subsample conv consumes.
 pub const INPUT_FEAT_SIZE: i32 = 128;
+/// Audio sample rate the front-end and encoder expect (16 kHz mono).
+pub const AUDIO_SAMPLE_RATE: i32 = 16_000;
 
 const fn default_hidden_size() -> i32 {
     1024

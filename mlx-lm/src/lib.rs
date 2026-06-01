@@ -19,6 +19,8 @@ pub mod user_input;
 pub mod utils;
 
 pub use language_model::{LanguageModel, TextOnlyProcessor, UserInputProcessor};
+#[cfg(feature = "audio")]
+pub use lm_input::ProcessedAudio;
 #[cfg(feature = "image")]
 pub use lm_input::ProcessedImage;
 pub use lm_input::{LMInput, PrepareResult, Text};
@@ -27,6 +29,8 @@ pub use model_context::{
     TokenCallback,
 };
 pub use sampler::{Sampler, SamplerState};
+#[cfg(feature = "audio")]
+pub use user_input::Audio;
 #[cfg(feature = "image")]
 pub use user_input::Image;
 pub use user_input::{Prompt, UserInput};

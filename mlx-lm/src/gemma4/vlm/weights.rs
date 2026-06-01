@@ -314,4 +314,54 @@ mod tests {
             Bucket::EmbedAudio(p) if p == "embedding_projection.weight"
         ));
     }
+
+    /// Real-weight regression: load an e2b/e4b checkpoint, run the loaded audio
+    /// tower over a deterministic 440 Hz sine, and check the output statistics.
+    /// Locks the load path (clip buffers, key binding, dtype) — a dropped clip
+    /// or unbound weight shifts the magnitude by ~5× and fails. Run:
+    /// `MODEL=<e4b dir> cargo test -p mlx-lm --features audio --lib -- \
+    ///   --ignored --test-threads=1 audio_encoder_real_weights_stats`
+    #[cfg(feature = "audio")]
+    #[test]
+    #[ignore = "requires a local gemma-4 e2b/e4b checkpoint via MODEL"]
+    fn audio_encoder_real_weights_stats() {
+        use crate::gemma4::audio::feature::log_mel;
+        use mlx_rs::ops::abs;
+        use std::path::PathBuf;
+
+        let dir = PathBuf::from(std::env::var("MODEL").expect("set MODEL=<e4b checkpoint dir>"));
+        let cfg = Config::from_dir(&dir).expect("parse config");
+        let env = cfg.family.as_gemma4().expect("gemma4 config");
+        let vision_cfg = env.vision_config.as_ref().expect("vision_config");
+        let towers = load_full_model(&cfg, env, vision_cfg, &dir).expect("load");
+        let (enc, _) = towers.audio.expect("checkpoint has no audio tower");
+
+        // Deterministic 0.3 s 440 Hz sine at 16 kHz.
+        let sr = 16_000usize;
+        let n = sr * 3 / 10;
+        let wav: Vec<f32> = (0..n)
+            .map(|i| 0.3 * (std::f32::consts::TAU * 440.0 * i as f32 / sr as f32).sin())
+            .collect();
+        let mel = log_mel(&wav).expect("log_mel");
+        let mut enc = enc;
+        let out = enc.forward(&mel).expect("encode");
+        let out = out.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let mean = out.mean(None).unwrap().item::<f32>();
+        let absmax = abs(&out).unwrap().max(None).unwrap().item::<f32>();
+        eprintln!(
+            "audio encoder: shape {:?} mean {mean:.4} absmax {absmax:.4}",
+            out.shape()
+        );
+
+        // Reference (gemma-4-e4b-it-8bit): mean ≈ 0, absmax ≈ 47. The clip-drop
+        // bug pushed absmax to ~240; an unbound projection collapses it toward 0.
+        assert!(
+            mean.abs() < 1.0,
+            "mean {mean} out of band — load path regressed"
+        );
+        assert!(
+            (20.0..80.0).contains(&absmax),
+            "absmax {absmax} out of band — clip buffers likely dropped/unbound"
+        );
+    }
 }

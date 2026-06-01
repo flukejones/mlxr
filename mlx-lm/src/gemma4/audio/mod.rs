@@ -3,4 +3,5 @@
 pub mod clippable;
 pub mod config;
 pub mod encoder;
+pub mod feature;
 pub mod multimodal;

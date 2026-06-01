@@ -22,6 +22,10 @@ pub struct UserInput {
     #[cfg(feature = "image")]
     pub images: Vec<Image>,
 
+    /// Audio clips attached to the conversation, in order. Gated on `audio`.
+    #[cfg(feature = "audio")]
+    pub audio: Vec<Audio>,
+
     /// Named values forwarded to the chat-template render (e.g.
     /// `enable_thinking`). Empty by default.
     pub template_kwargs: HashMap<String, serde_json::Value>,
@@ -41,6 +45,8 @@ impl UserInput {
             prompt: Prompt::Text(prompt.into()),
             #[cfg(feature = "image")]
             images: Vec::new(),
+            #[cfg(feature = "audio")]
+            audio: Vec::new(),
             template_kwargs: HashMap::new(),
         }
     }
@@ -51,6 +57,8 @@ impl UserInput {
             prompt: Prompt::Chat(messages),
             #[cfg(feature = "image")]
             images: Vec::new(),
+            #[cfg(feature = "audio")]
+            audio: Vec::new(),
             template_kwargs: HashMap::new(),
         }
     }
@@ -60,6 +68,14 @@ impl UserInput {
     #[must_use]
     pub fn with_images(mut self, images: Vec<Image>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// Attach audio clips, builder-style.
+    #[cfg(feature = "audio")]
+    #[must_use]
+    pub fn with_audio(mut self, audio: Vec<Audio>) -> Self {
+        self.audio = audio;
         self
     }
 
@@ -90,6 +106,15 @@ pub enum Image {
         /// `[t, h, w]` patch counts; product must equal `array.shape[0]`.
         grid: [i32; 3],
     },
+}
+
+/// One audio clip attached to a [`UserInput`]: 16 kHz mono `f32` samples.
+/// The processor computes the log-mel features; the caller pre-resamples to
+/// 16 kHz mono.
+#[cfg(feature = "audio")]
+pub struct Audio {
+    /// Mono PCM samples at 16 kHz.
+    pub samples: Vec<f32>,
 }
 
 #[cfg(test)]

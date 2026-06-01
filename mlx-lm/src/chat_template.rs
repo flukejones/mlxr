@@ -44,6 +44,18 @@ impl ChatMessage {
         }
     }
 
+    /// User message: `[audio, text]`. Audio models splice the clip into
+    /// the audio-pad slot at runtime.
+    pub fn user_with_audio(text: impl Into<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart::Audio,
+                ContentPart::Text { text: text.into() },
+            ]),
+        }
+    }
+
     pub fn system(text: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
@@ -76,6 +88,8 @@ pub enum ContentPart {
     },
     /// Image placeholder; template emits image-pad token(s).
     Image,
+    /// Audio placeholder; template emits audio-pad token(s).
+    Audio,
 }
 
 /// A parsed chat template, ready to render messages.

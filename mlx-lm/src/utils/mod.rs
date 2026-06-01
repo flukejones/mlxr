@@ -74,7 +74,7 @@ fn index_out_of_bound_exception() -> Exception {
 
 #[allow(non_snake_case)]
 pub(crate) fn quantized_scaled_dot_product_attention(
-    queries: Array,
+    queries: &Array,
     mut q_keys: QuantizedKeys,
     mut q_values: QuantizedValues,
     scale: f32,
@@ -226,7 +226,7 @@ where
             };
 
             return quantized_scaled_dot_product_attention(
-                queries, keys, values, scale, mask, group_size, bits,
+                &queries, keys, values, scale, mask, group_size, bits,
             );
         }
     }

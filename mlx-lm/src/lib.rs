@@ -4,6 +4,7 @@ pub mod chat_template;
 pub mod config;
 pub mod error;
 pub mod family;
+pub mod gemma4;
 pub mod language_model;
 pub mod llama;
 pub mod lm_input;

@@ -24,3 +24,19 @@ pub use options::{
 pub use quantized_kvcache::QuantizedKVCache;
 pub use rotating_kvcache::RotatingKVCache;
 pub use trait_def::KeyValueCache;
+
+/// Effective per-chunk prefill cap for a cache stack: the smallest
+/// bounded slot's `max_size` (e.g. a sliding window), combined with the
+/// user's `max_prefill_chunk`. A windowed layer can never usefully attend
+/// to more than its window in one pass, so chunks above that gain nothing.
+pub fn effective_prefill_chunk_opt<C: KeyValueCache>(
+    cache: &[Option<C>],
+    user_cap: Option<i32>,
+) -> Option<i32> {
+    let window = cache.iter().filter_map(|c| c.as_ref()?.max_size()).min();
+    match (window, user_cap) {
+        (Some(w), Some(u)) => Some(w.min(u)),
+        (Some(w), None) => Some(w),
+        (None, u) => u,
+    }
+}

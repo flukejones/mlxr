@@ -22,8 +22,12 @@ use std::sync::OnceLock;
 use mlx_rs::{
     error::Exception,
     nn,
-    ops::sigmoid,
-    transforms::compile::{allocate_compile_id, shape::TwoArgs, CallMut, Compile, Compiled},
+    ops::{sigmoid, tanh},
+    transforms::compile::{
+        allocate_compile_id,
+        shape::{ThreeArgs, TwoArgs},
+        CallMut, Compile, Compiled,
+    },
     Array,
 };
 
@@ -36,6 +40,18 @@ fn swiglu_id() -> usize {
     *ID.get_or_init(allocate_compile_id)
 }
 fn attention_gate_id() -> usize {
+    static ID: OnceLock<usize> = OnceLock::new();
+    *ID.get_or_init(allocate_compile_id)
+}
+fn geglu_id() -> usize {
+    static ID: OnceLock<usize> = OnceLock::new();
+    *ID.get_or_init(allocate_compile_id)
+}
+fn logit_softcap_id() -> usize {
+    static ID: OnceLock<usize> = OnceLock::new();
+    *ID.get_or_init(allocate_compile_id)
+}
+fn residual_add_scale_id() -> usize {
     static ID: OnceLock<usize> = OnceLock::new();
     *ID.get_or_init(allocate_compile_id)
 }
@@ -52,6 +68,24 @@ pub type AttentionGateCompiled = Compiled<
     TwoArgs,
 >;
 
+pub type GegluCompiled = Compiled<
+    fn((&Array, &Array)) -> Result<Array, Exception>,
+    Box<dyn FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send + 'static>,
+    TwoArgs,
+>;
+
+pub type LogitSoftcapCompiled = Compiled<
+    fn((&Array, &Array)) -> Result<Array, Exception>,
+    Box<dyn FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send + 'static>,
+    TwoArgs,
+>;
+
+pub type ResidualAddScaleCompiled = Compiled<
+    fn((&Array, &Array, &Array)) -> Result<Array, Exception>,
+    Box<dyn FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send + 'static>,
+    ThreeArgs,
+>;
+
 /// Cached compiled-graph slot for [`swiglu`]. Owned by the calling module
 /// (typically a per-layer `Mlp::swiglu_cache`). Initialised lazily on first
 /// call. Custom `Debug` is opaque — the inner `Compiled` wraps a
@@ -61,6 +95,18 @@ pub struct SwigluCache(pub Option<SwigluCompiled>);
 
 #[derive(Default)]
 pub struct AttentionGateCache(pub Option<AttentionGateCompiled>);
+
+/// Cached compiled-graph slot for [`geglu`].
+#[derive(Default)]
+pub struct GegluCache(pub Option<GegluCompiled>);
+
+/// Cached compiled-graph slot for [`logit_softcap`].
+#[derive(Default)]
+pub struct LogitSoftcapCache(pub Option<LogitSoftcapCompiled>);
+
+/// Cached compiled-graph slot for [`residual_add_scale`].
+#[derive(Default)]
+pub struct ResidualAddScaleCache(pub Option<ResidualAddScaleCompiled>);
 
 impl std::fmt::Debug for SwigluCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,6 +119,30 @@ impl std::fmt::Debug for SwigluCache {
 impl std::fmt::Debug for AttentionGateCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttentionGateCache")
+            .field("filled", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for GegluCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GegluCache")
+            .field("filled", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LogitSoftcapCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogitSoftcapCache")
+            .field("filled", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ResidualAddScaleCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResidualAddScaleCache")
             .field("filled", &self.0.is_some())
             .finish()
     }
@@ -115,6 +185,69 @@ pub fn attention_gate(
 
 fn attention_gate_inner((output, gate): (&Array, &Array)) -> Result<Array, Exception> {
     sigmoid(gate)?.multiply(output)
+}
+
+/// `gelu_approximate(gate) * up` as a compile-fused kernel — Gemma's GeGLU
+/// MLP activation. Caller-owned cache, same shape as [`swiglu`].
+pub fn geglu(cache: &mut GegluCache, gate: &Array, up: &Array) -> Result<Array, Exception> {
+    let compiled = cache.0.get_or_insert_with(|| {
+        Compile::<(&Array, &Array), Array, Exception>::compile_with_id(
+            geglu_inner as fn((&Array, &Array)) -> Result<Array, Exception>,
+            geglu_id(),
+            true,
+        )
+    });
+    CallMut::call_mut(compiled, (gate, up))
+}
+
+fn geglu_inner((gate, up): (&Array, &Array)) -> Result<Array, Exception> {
+    nn::gelu_approximate(gate)?.multiply(up)
+}
+
+/// `tanh(x / cap) * cap` — Gemma final-logit soft-capping. `cap` is passed
+/// as a 0-d `Array` so the compiled graph stays stable across calls.
+pub fn logit_softcap(
+    cache: &mut LogitSoftcapCache,
+    x: &Array,
+    cap: &Array,
+) -> Result<Array, Exception> {
+    let compiled = cache.0.get_or_insert_with(|| {
+        Compile::<(&Array, &Array), Array, Exception>::compile_with_id(
+            logit_softcap_inner as fn((&Array, &Array)) -> Result<Array, Exception>,
+            logit_softcap_id(),
+            true,
+        )
+    });
+    CallMut::call_mut(compiled, (x, cap))
+}
+
+fn logit_softcap_inner((x, cap): (&Array, &Array)) -> Result<Array, Exception> {
+    tanh(&x.divide(cap)?)?.multiply(cap)
+}
+
+/// `(residual + ff_out) * layer_scalar` as one compile-fused kernel —
+/// Gemma's per-layer epilogue on bf16/fp32. `layer_scalar` is a 0-d/`[1]`
+/// `Array`. (fp16 callers take the unfused `clip_residual` path instead.)
+pub fn residual_add_scale(
+    cache: &mut ResidualAddScaleCache,
+    residual: &Array,
+    ff_out: &Array,
+    layer_scalar: &Array,
+) -> Result<Array, Exception> {
+    let compiled = cache.0.get_or_insert_with(|| {
+        Compile::<(&Array, &Array, &Array), Array, Exception>::compile_with_id(
+            residual_add_scale_inner as fn((&Array, &Array, &Array)) -> Result<Array, Exception>,
+            residual_add_scale_id(),
+            true,
+        )
+    });
+    CallMut::call_mut(compiled, (residual, ff_out, layer_scalar))
+}
+
+fn residual_add_scale_inner(
+    (residual, ff_out, layer_scalar): (&Array, &Array, &Array),
+) -> Result<Array, Exception> {
+    residual.add(ff_out)?.multiply(layer_scalar)
 }
 
 #[cfg(test)]
@@ -166,5 +299,61 @@ mod tests {
             .unwrap()
             .item::<f32>();
         assert!(max < 1e-5, "attention_gate diverged after swiglu: {max}");
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        a.subtract(b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    #[test]
+    fn geglu_matches_manual_gelu_multiply() {
+        let gate = Array::from_slice(&[1.0_f32, -1.0, 0.5, 2.0], &[2, 2]);
+        let up = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let mut cache = GegluCache::default();
+        let fused = geglu(&mut cache, &gate, &up).unwrap();
+        let manual = nn::gelu_approximate(&gate).unwrap().multiply(&up).unwrap();
+        assert!(
+            max_abs_diff(&fused, &manual) < 1e-5,
+            "fused vs manual geglu diverge"
+        );
+    }
+
+    #[test]
+    fn logit_softcap_matches_manual() {
+        let x = Array::from_slice(&[-60.0_f32, -5.0, 0.0, 5.0, 60.0, 100.0], &[2, 3]);
+        let cap = Array::from_f32(30.0);
+        let mut cache = LogitSoftcapCache::default();
+        let fused = logit_softcap(&mut cache, &x, &cap).unwrap();
+        let manual = tanh(x.divide(&cap).unwrap())
+            .unwrap()
+            .multiply(&cap)
+            .unwrap();
+        assert!(
+            max_abs_diff(&fused, &manual) < 1e-4,
+            "fused vs manual logit_softcap diverge"
+        );
+        // Soft-cap clamps magnitude below the cap.
+        let max_mag = fused.abs().unwrap().max(None).unwrap().item::<f32>();
+        assert!(max_mag < 30.0, "softcap did not bound magnitude: {max_mag}");
+    }
+
+    #[test]
+    fn residual_add_scale_matches_manual() {
+        let h = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let ff = Array::from_slice(&[0.5_f32, -0.5, 1.0, -1.0], &[2, 2]);
+        let scalar = Array::from_slice(&[2.0_f32], &[1]);
+        let mut cache = ResidualAddScaleCache::default();
+        let fused = residual_add_scale(&mut cache, &h, &ff, &scalar).unwrap();
+        let manual = h.add(&ff).unwrap().multiply(&scalar).unwrap();
+        assert!(
+            max_abs_diff(&fused, &manual) < 1e-5,
+            "fused vs manual residual_add_scale diverge"
+        );
     }
 }

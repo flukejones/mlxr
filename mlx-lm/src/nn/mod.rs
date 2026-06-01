@@ -2,12 +2,14 @@
 
 pub mod attention_input;
 pub mod model_input;
+pub mod rms_norm_no_scale;
 pub mod router_topk;
 pub mod swiglu_mlp;
 pub mod switch;
 
 pub use attention_input::AttentionInput;
 pub use model_input::ModelInput;
+pub use rms_norm_no_scale::RmsNormNoScale;
 pub use swiglu_mlp::SwigluMlp;
 
 use crate::cache::KeyValueCache;

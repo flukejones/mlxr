@@ -426,6 +426,12 @@ fn bench_decode(c: &mut Criterion) {
             "mlx-community/Qwen3.6-35B-A3B-q8-mtp",
         );
         maybe_bench_mtp(c, "a3b_q8", "mlx-community/Qwen3.6-35B-A3B-q8-mtp");
+
+        // gemma4 dense 31B — hybrid sliding/global attention + proportional
+        // rope. Memory-bandwidth-bound; q4 vs q8 isolates the weight-bits
+        // effect on decode. Full-set only; each self-skips when absent.
+        maybe_bench(c, "gemma4", "31b_it_q4", "mlx-community/gemma-4-31b-it-4bit");
+        maybe_bench(c, "gemma4", "31b_it_q8", "mlx-community/gemma-4-31b-it-8bit");
     }
 }
 

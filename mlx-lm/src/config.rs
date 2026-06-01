@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::error::Error;
+use crate::gemma4::text::config as gemma4;
 use crate::llama::text::config as llama;
 use crate::quantization::QuantizationConfig;
 use crate::qwen3::text::config as qwen3;
@@ -77,6 +78,13 @@ pub enum Family {
         alias = "qwen3_5vlforconditionalgeneration"
     )]
     Qwen35Vl(qwen35::ModelConfig),
+    #[serde(
+        rename = "gemma4",
+        alias = "gemma4_text",
+        alias = "gemma4textmodel",
+        alias = "gemma4forcausallm"
+    )]
+    Gemma4(gemma4::ModelConfig),
 }
 
 impl Family {
@@ -88,6 +96,7 @@ impl Family {
             Self::Qwen35(_) => "qwen3_5",
             Self::Qwen35Moe(_) => "qwen3_5_moe",
             Self::Qwen35Vl(_) => "qwen3_5_vl",
+            Self::Gemma4(_) => "gemma4",
         }
     }
 
@@ -108,6 +117,13 @@ impl Family {
     pub fn as_qwen35(&self) -> Option<&qwen35::ModelConfig> {
         match self {
             Self::Qwen35(env) | Self::Qwen35Moe(env) | Self::Qwen35Vl(env) => Some(env),
+            _ => None,
+        }
+    }
+
+    pub fn as_gemma4(&self) -> Option<&gemma4::ModelConfig> {
+        match self {
+            Self::Gemma4(env) => Some(env),
             _ => None,
         }
     }

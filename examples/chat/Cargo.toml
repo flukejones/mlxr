@@ -1,0 +1,19 @@
+[package]
+name = "chat"
+edition.workspace = true
+version = "0.0.1"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "chat"
+path = "src/bin/chat.rs"
+
+[dependencies]
+mlx-lm.workspace = true
+anyhow = "1"
+argh = "0.1"
+rustyline = { version = "18", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["std"] }

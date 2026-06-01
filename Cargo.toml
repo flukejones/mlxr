@@ -25,6 +25,7 @@ members = [
     "mlx-lm-utils",
     "mlx-tests",
     "xtask",
+    "examples/chat",
 ]
 
 resolver = "2"

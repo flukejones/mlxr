@@ -14,7 +14,7 @@ use argh::FromArgs;
 use chat::think_stream::ThinkStream;
 use mlx_lm::cache::{CacheKind, CacheOptions, DEFAULT_KV_GROUP_SIZE};
 use mlx_lm::chat_template::ChatMessage;
-use mlx_lm::{generate, load, GenerateParams, ModelContext, Sampler, UserInput};
+use mlx_lm::{generate, load, GenerateParams, Image, ModelContext, Sampler, UserInput};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -78,6 +78,14 @@ struct Args {
     /// max tokens per prefill chunk (default 2048). 0 disables chunking.
     #[argh(option, long = "prefill-chunk-size")]
     prefill_chunk_size: Option<i32>,
+
+    /// path to an image (VLM models); runs one-shot with --prompt, then exits
+    #[argh(option)]
+    image: Option<PathBuf>,
+
+    /// instruction sent alongside --image (default empty)
+    #[argh(option, default = "String::new()")]
+    prompt: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -194,6 +202,19 @@ fn main() -> Result<()> {
         })
         .context("set kv-cache options")?;
 
+    // One-shot VLM path: --image runs a single image+prompt turn, then exits.
+    if let Some(image_path) = &args.image {
+        let img = image::open(image_path).context("open image")?;
+        let msg = ChatMessage::user_with_image(&args.prompt);
+        let input = apply_think(
+            UserInput::chat(vec![msg]).with_images(vec![Image::Decoded(img)]),
+            args.think,
+        );
+        run_turn(&mut ctx, input, build_params(&args))?;
+        println!();
+        return Ok(());
+    }
+
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut editor = DefaultEditor::new().context("rustyline init")?;
     eprintln!("[ready. /exit to quit. /reset to clear history.]");
@@ -219,30 +240,9 @@ fn main() -> Result<()> {
         editor.add_history_entry(trimmed).ok();
 
         history.push(ChatMessage::user(trimmed));
-        let mut user_input = UserInput::chat(history.clone());
-        match args.think {
-            ThinkMode::On => {
-                user_input = user_input
-                    .with_template_kwarg("enable_thinking", serde_json::Value::Bool(true));
-            }
-            ThinkMode::Off => {
-                user_input = user_input
-                    .with_template_kwarg("enable_thinking", serde_json::Value::Bool(false));
-            }
-            ThinkMode::Default => {}
-        }
-        let sampling = match (args.temperature, args.top_p) {
-            (0.0, _) => Sampler::Greedy,
-            (t, None) => Sampler::Temperature(t),
-            (t, Some(p)) => Sampler::TopP { temperature: t, p },
-        };
-        let params = GenerateParams {
-            max_new_tokens: args.max_tokens,
-            sampling,
-            ..GenerateParams::default()
-        };
+        let user_input = apply_think(UserInput::chat(history.clone()), args.think);
 
-        match run_turn(&mut ctx, user_input, params) {
+        match run_turn(&mut ctx, user_input, build_params(&args)) {
             Ok(text) => history.push(ChatMessage::assistant(text)),
             Err(e) => {
                 // Pop the unanswered user turn so the next prompt
@@ -254,6 +254,33 @@ fn main() -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// Apply the `--think` mode as the template's `enable_thinking` kwarg.
+fn apply_think(input: UserInput, think: ThinkMode) -> UserInput {
+    match think {
+        ThinkMode::On => {
+            input.with_template_kwarg("enable_thinking", serde_json::Value::Bool(true))
+        }
+        ThinkMode::Off => {
+            input.with_template_kwarg("enable_thinking", serde_json::Value::Bool(false))
+        }
+        ThinkMode::Default => input,
+    }
+}
+
+/// Resolve `--temperature`/`--top-p`/`--max-tokens` into [`GenerateParams`].
+fn build_params(args: &Args) -> GenerateParams {
+    let sampling = match (args.temperature, args.top_p) {
+        (0.0, _) => Sampler::Greedy,
+        (t, None) => Sampler::Temperature(t),
+        (t, Some(p)) => Sampler::TopP { temperature: t, p },
+    };
+    GenerateParams {
+        max_new_tokens: args.max_tokens,
+        sampling,
+        ..GenerateParams::default()
+    }
 }
 
 fn run_turn(ctx: &mut ModelContext, input: UserInput, params: GenerateParams) -> Result<String> {

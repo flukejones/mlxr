@@ -15,5 +15,6 @@ path = "src/bin/chat.rs"
 mlx-lm.workspace = true
 anyhow = "1"
 argh = "0.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rustyline = { version = "18", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }

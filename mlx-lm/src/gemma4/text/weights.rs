@@ -47,7 +47,7 @@ fn should_drop(key: &str) -> bool {
 
 /// Strip the multimodal-wrapper prefix(es) so a text-only `Model` can
 /// consume the keys.
-fn rewrite_outer_key(key: &str) -> String {
+pub(crate) fn rewrite_outer_key(key: &str) -> String {
     if let Some(rest) = key.strip_prefix("language_model.model.") {
         return format!("model.{rest}");
     }
@@ -64,7 +64,7 @@ fn rewrite_outer_key(key: &str) -> String {
 /// must be dropped: those layers own no K/V projection (they reuse a prior
 /// layer's), so the model has no slot for them. Key is post-`rewrite_outer_key`
 /// (`model.layers.N.…`).
-fn is_shared_kv_layer_key(key: &str, num_layers: i32, num_shared: i32) -> bool {
+pub(crate) fn is_shared_kv_layer_key(key: &str, num_layers: i32, num_shared: i32) -> bool {
     if num_shared <= 0 {
         return false;
     }

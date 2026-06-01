@@ -8,6 +8,8 @@ use crate::config::ModelConfig;
 use crate::error::Error;
 use crate::family::LoadedContext;
 
+#[cfg(feature = "image")]
+pub mod image;
 pub mod text;
 
 pub(crate) fn load_context(cfg: &ModelConfig, dir: &Path) -> Result<LoadedContext, Error> {

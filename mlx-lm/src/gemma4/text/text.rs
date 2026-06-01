@@ -755,15 +755,44 @@ where
 
     fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
         let ModelInput { inputs, cache, .. } = input;
-        let mut h = self.embed_tokens.forward(inputs)?;
-        // Stage scale in h's dtype so the multiply stays bf16/fp16.
+        let h = self.embed_scaled(inputs)?;
+        self.forward_from_hidden(h, inputs, cache)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.embed_tokens.training_mode(mode);
+        for layer in &mut self.layers {
+            layer.training_mode_set(mode);
+        }
+        self.norm.training_mode(mode);
+    }
+}
+
+impl Gemma4TextModel {
+    /// `embed_tokens(ids) * embed_scale`, scale staged in the embedding
+    /// dtype so the multiply stays bf16/fp16.
+    pub fn embed_scaled(&mut self, inputs: &Array) -> Result<Array, Error> {
+        let h = self.embed_tokens.forward(inputs)?;
         let h_dtype = h.dtype();
-        let embed_scale_arr = self.embed_scale_arr.get_or_init(|| {
+        let scale = self.embed_scale_arr.get_or_init(|| {
             Array::from_f32(self.embed_scale)
                 .as_dtype(h_dtype)
                 .expect("embed_scale cast cannot fail")
         });
-        h = h.multiply(embed_scale_arr)?;
+        Ok(h.multiply(scale)?)
+    }
+
+    /// Decoder body shared by token and pre-stitched-embedding entry points:
+    /// per-layer inputs, masks, the KV-shared layer loop, final norm. `inputs`
+    /// (token ids) still drives the per-layer-input embedding even when `h`
+    /// comes from stitched multimodal embeddings.
+    fn forward_from_hidden<C: KeyValueCache>(
+        &mut self,
+        mut h: Array,
+        inputs: &Array,
+        cache: &mut [Option<C>],
+    ) -> Result<Array, Error> {
+        let h_dtype = h.dtype();
 
         // Per-layer inputs `[B, L, num_layers, pl]`, sliced axis-2 per layer.
         let per_layer_inputs: Option<Vec<Array>> = if self.hidden_size_per_layer_input > 0 {
@@ -859,12 +888,23 @@ where
         Ok(self.norm.forward(&h)?)
     }
 
-    fn training_mode(&mut self, mode: bool) {
-        self.embed_tokens.training_mode(mode);
-        for layer in &mut self.layers {
-            layer.training_mode_set(mode);
-        }
-        self.norm.training_mode(mode);
+    /// Decode pre-stitched `inputs_embeds`, bypassing `embed_tokens`. Text rows
+    /// are pre-scaled by `embed_scale`; stitched vision features are not.
+    #[cfg(feature = "image")]
+    pub fn forward_embeds<C: KeyValueCache>(
+        &mut self,
+        inputs_embeds: Array,
+        inputs: &Array,
+        cache: &mut [Option<C>],
+    ) -> Result<Array, Error> {
+        self.forward_from_hidden(inputs_embeds, inputs, cache)
+    }
+
+    /// Raw token embeddings (no `embed_scale`); the VLM adapter scales text
+    /// rows itself before stitching vision features in.
+    #[cfg(feature = "image")]
+    pub fn embed_tokens(&mut self, inputs: &Array) -> Result<Array, Error> {
+        Ok(self.embed_tokens.forward(inputs)?)
     }
 }
 
@@ -927,23 +967,15 @@ impl Model {
             softcap_array: std::sync::OnceLock::new(),
         })
     }
-}
 
-impl<C> Module<ModelInput<'_, C>> for Model
-where
-    C: KeyValueCache,
-{
-    type Output = Array;
-    type Error = Error;
-
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let out = self.model.forward(input)?;
+    /// LM head + final-logit softcap, shared by `forward` and `forward_embeds`.
+    fn apply_head(&mut self, out: &Array) -> Result<Array, Error> {
         let mut logits = if let Some(lm) = self.lm_head.as_mut() {
-            lm.forward(&out)?
+            lm.forward(out)?
         } else {
             match &self.model.embed_tokens {
-                MaybeQuantized::Original(e) => e.as_linear(&out)?,
-                MaybeQuantized::Quantized(qe) => qe.as_linear(&out)?,
+                MaybeQuantized::Original(e) => e.as_linear(out)?,
+                MaybeQuantized::Quantized(qe) => qe.as_linear(out)?,
             }
         };
         if let Some(cap) = self.final_logit_softcapping {
@@ -956,6 +988,32 @@ where
             logits = logit_softcap(&mut self.softcap_cache, &logits, cap_arr)?;
         }
         Ok(logits)
+    }
+
+    /// VLM decode/prefill over pre-stitched embeddings; `inputs` (token ids)
+    /// still drives the per-layer-input embedding.
+    #[cfg(feature = "image")]
+    pub fn forward_embeds<C: KeyValueCache>(
+        &mut self,
+        inputs_embeds: Array,
+        inputs: &Array,
+        cache: &mut [Option<C>],
+    ) -> Result<Array, Error> {
+        let out = self.model.forward_embeds(inputs_embeds, inputs, cache)?;
+        self.apply_head(&out)
+    }
+}
+
+impl<C> Module<ModelInput<'_, C>> for Model
+where
+    C: KeyValueCache,
+{
+    type Output = Array;
+    type Error = Error;
+
+    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
+        let out = self.model.forward(input)?;
+        self.apply_head(&out)
     }
 
     fn training_mode(&mut self, mode: bool) {

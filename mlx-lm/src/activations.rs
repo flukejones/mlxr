@@ -201,7 +201,27 @@ pub fn geglu(cache: &mut GegluCache, gate: &Array, up: &Array) -> Result<Array, 
 }
 
 fn geglu_inner((gate, up): (&Array, &Array)) -> Result<Array, Exception> {
-    nn::gelu_approximate(gate)?.multiply(up)
+    gelu_approximate_in_dtype(gate)?.multiply(up)
+}
+
+/// Dtype-preserving gelu approximation. `mlx_rs::nn::gelu_approximate`
+/// builds its constants as `array!(0.5_f32)` etc., promoting bf16/f16
+/// inputs to f32 — and that f32 then cascades through the whole MoE
+/// forward (residual → next layer → expert `gather_qmm` in f32), which is
+/// ~4× slower at decode. Staging the scalars into the input dtype keeps
+/// the graph in-place.
+fn gelu_approximate_in_dtype(x: &Array) -> Result<Array, Exception> {
+    let dt = x.dtype();
+    let cast = |c: f32| -> Result<Array, Exception> { Array::from_f32(c).as_dtype(dt) };
+    let half = cast(0.5)?;
+    let one = cast(1.0)?;
+    let sqrt_2_over_pi = cast((2.0_f32 / std::f32::consts::PI).sqrt())?;
+    let k = cast(0.044715)?;
+    let x3 = x.multiply(x)?.multiply(x)?;
+    let inner = x.add(&k.multiply(&x3)?)?;
+    let scaled = sqrt_2_over_pi.multiply(&inner)?;
+    let t = tanh(&scaled)?;
+    half.multiply(x)?.multiply(&one.add(&t)?)
 }
 
 /// `tanh(x / cap) * cap` — Gemma final-logit soft-capping. `cap` is passed

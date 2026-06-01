@@ -21,6 +21,7 @@ use crate::activations::{
 use crate::cache::KeyValueCache;
 use crate::error::Error;
 use crate::gemma4::text::config::{LayerKind, TextConfig};
+use crate::gemma4::text::moe::{Experts, Router};
 use crate::gemma4::text::rope::{build_layer_rope, LayerRope};
 use crate::nn::{ModelInput, RmsNormNoScale};
 use crate::utils::{create_attention_mask, AttentionMask};
@@ -322,6 +323,9 @@ fn clip_residual(x: &Array, y: &Array) -> Result<Array, Error> {
 pub struct DecoderLayer {
     pub layer_idx: i32,
     pub layer_kind: LayerKind,
+    /// `true` for the 26b-a4b MoE variant — gates `router`/`experts` and
+    /// the dual-branch FFN. Dense layers keep all MoE fields `None`.
+    pub enable_moe: bool,
 
     #[quantizable]
     #[param]
@@ -329,6 +333,14 @@ pub struct DecoderLayer {
     #[quantizable]
     #[param]
     pub mlp: Mlp,
+    /// MoE router (`Some` iff `enable_moe`).
+    #[quantizable]
+    #[param]
+    pub router: Option<Router>,
+    /// MoE experts (`Some` iff `enable_moe`).
+    #[quantizable]
+    #[param]
+    pub experts: Option<Experts>,
 
     #[param]
     pub input_layernorm: nn::RmsNorm,
@@ -338,6 +350,15 @@ pub struct DecoderLayer {
     pub pre_feedforward_layernorm: nn::RmsNorm,
     #[param]
     pub post_feedforward_layernorm: nn::RmsNorm,
+    /// Post-norm on the dense branch of a MoE layer (`Some` iff `enable_moe`).
+    #[param]
+    pub post_feedforward_layernorm_1: Option<nn::RmsNorm>,
+    /// Pre-norm on the expert branch of a MoE layer (`Some` iff `enable_moe`).
+    #[param]
+    pub pre_feedforward_layernorm_2: Option<nn::RmsNorm>,
+    /// Post-norm on the expert branch of a MoE layer (`Some` iff `enable_moe`).
+    #[param]
+    pub post_feedforward_layernorm_2: Option<nn::RmsNorm>,
 
     /// Multiplicative per-layer scalar on the residual stream.
     #[param]
@@ -354,53 +375,149 @@ impl DecoderLayer {
                 .eps(args.rms_norm_eps)
                 .build()?)
         };
+
+        let enable_moe = args.enable_moe_block;
+        let (router, experts, post_ff_1, pre_ff_2, post_ff_2) = if enable_moe {
+            let num_experts = args
+                .num_experts
+                .ok_or_else(|| Error::config("gemma4 MoE: num_experts missing"))?;
+            let top_k = args
+                .top_k_experts
+                .ok_or_else(|| Error::config("gemma4 MoE: top_k_experts missing"))?;
+            let moe_intermediate = args
+                .moe_intermediate_size
+                .ok_or_else(|| Error::config("gemma4 MoE: moe_intermediate_size missing"))?;
+            (
+                Some(Router::new(
+                    args.hidden_size,
+                    num_experts,
+                    top_k,
+                    args.rms_norm_eps,
+                )?),
+                Some(Experts::new(
+                    args.hidden_size,
+                    moe_intermediate,
+                    num_experts,
+                    top_k,
+                )?),
+                Some(norm()?),
+                Some(norm()?),
+                Some(norm()?),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+
         Ok(Self {
             layer_idx,
             layer_kind,
+            enable_moe,
             self_attn: Attention::new(args, layer_idx)?,
             mlp: Mlp::new(args)?,
+            router,
+            experts,
             input_layernorm: norm()?,
             post_attention_layernorm: norm()?,
             pre_feedforward_layernorm: norm()?,
             post_feedforward_layernorm: norm()?,
+            post_feedforward_layernorm_1: post_ff_1,
+            pre_feedforward_layernorm_2: pre_ff_2,
+            post_feedforward_layernorm_2: post_ff_2,
             layer_scalar: Param::new(Array::ones::<f32>(&[1])?),
             residual_scale_cache: ResidualAddScaleCache::default(),
         })
     }
 
+    /// `shared_kv`/`offset` feed the KV-sharing extension (E2B/E4B); the
+    /// dense + MoE base always passes `None`. `per_layer_input` feeds the
+    /// per-layer-input gating (E2B/E4B); `None` here. Returns the layer's
+    /// `(k, v)` + pre-update offset so a downstream KV-shared layer can
+    /// reuse them. These three args are the one forward-compat hook so the
+    /// E2B/E4B follow-on is body-only.
     pub fn forward_layer<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<&mut C>,
-    ) -> Result<Array, Error> {
+        shared_kv: Option<(Array, Array)>,
+        offset: Option<i32>,
+        per_layer_input: Option<&Array>,
+    ) -> Result<AttentionOut, Error> {
         let h_pre = self.input_layernorm.forward(x)?;
-        let AttentionOut { h, .. } = self.self_attn.attend(GemmaAttnInput {
+        let AttentionOut {
+            h,
+            shared_kv: kv_out,
+            offset: off_out,
+        } = self.self_attn.attend(GemmaAttnInput {
             x: &h_pre,
             mask,
             cache,
-            shared_kv: None,
-            offset: None,
+            shared_kv,
+            offset,
         })?;
         let h = self.post_attention_layernorm.forward(&h)?;
         let h = clip_residual(x, &h)?;
 
-        let mid = self.pre_feedforward_layernorm.forward(&h)?;
-        let ff_mid = self.mlp.forward(&mid)?;
+        let ff_mid = if self.enable_moe {
+            // Dense branch: post_1(MLP(pre_ff(h))).
+            let h1 = self.pre_feedforward_layernorm.forward(&h)?;
+            let h1 = self.mlp.forward(&h1)?;
+            let h1 = self
+                .post_feedforward_layernorm_1
+                .as_mut()
+                .expect("moe layer has post_ff_1")
+                .forward(&h1)?;
+            // Expert branch: post_2(Experts(pre_2(h), router(h))).
+            let (idx, w) = self
+                .router
+                .as_mut()
+                .expect("moe layer has router")
+                .forward(&h)?;
+            let h2 = self
+                .pre_feedforward_layernorm_2
+                .as_mut()
+                .expect("moe layer has pre_ff_2")
+                .forward(&h)?;
+            let h2 = self
+                .experts
+                .as_mut()
+                .expect("moe layer has experts")
+                .forward(&h2, &idx, &w)?;
+            let h2 = self
+                .post_feedforward_layernorm_2
+                .as_mut()
+                .expect("moe layer has post_ff_2")
+                .forward(&h2)?;
+            h1.add(&h2)?
+        } else {
+            let mid = self.pre_feedforward_layernorm.forward(&h)?;
+            self.mlp.forward(&mid)?
+        };
+        // Both branches share the final post-norm before the residual add.
         let ff_out = self.post_feedforward_layernorm.forward(&ff_mid)?;
 
+        // `per_layer_input` is the E2B/E4B gating hook; unused in the dense +
+        // MoE base (the per-layer gate/proj/norm fields land with that
+        // extension). The arg keeps `forward_layer`'s signature stable.
+        let _ = per_layer_input;
+
         // bf16/fp32: fuse `(h + ff_out) * layer_scalar`. fp16: clip then scale.
-        if ff_out.dtype() != Dtype::Float16 {
-            Ok(residual_add_scale(
+        let out = if ff_out.dtype() != Dtype::Float16 {
+            residual_add_scale(
                 &mut self.residual_scale_cache,
                 &h,
                 &ff_out,
                 self.layer_scalar.as_ref(),
-            )?)
+            )?
         } else {
             let h = clip_residual(&h, &ff_out)?;
-            Ok(h.multiply(self.layer_scalar.as_ref())?)
-        }
+            h.multiply(self.layer_scalar.as_ref())?
+        };
+        Ok(AttentionOut {
+            h: out,
+            shared_kv: kv_out,
+            offset: off_out,
+        })
     }
 
     pub fn training_mode_set(&mut self, mode: bool) {
@@ -494,7 +611,10 @@ where
                 LayerKind::SlidingAttention => sliding_mask.as_ref(),
             };
             let cache_slot = cache.get_mut(i).and_then(|c| c.as_mut());
-            h = layer.forward_layer(&h, mask, cache_slot)?;
+            // KV-sharing + per-layer-input are E2B/E4B extensions; the dense
+            // and MoE base pass None.
+            let out = layer.forward_layer(&h, mask, cache_slot, None, None, None)?;
+            h = out.h;
         }
 
         Ok(self.norm.forward(&h)?)
@@ -710,5 +830,66 @@ mod tests {
         // final_logit_softcapping = 30.0 ⇒ |logits| < 30.
         let max_mag = logits.abs().unwrap().max(None).unwrap().item::<f32>();
         assert!(max_mag < 30.0, "softcap did not bound logits: {max_mag}");
+    }
+
+    /// `synthetic()` + the MoE gate so every layer runs the dual branch.
+    fn synthetic_moe() -> TextConfig {
+        let json = serde_json::json!({
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "head_dim": 8,
+            "global_head_dim": 8,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 100,
+            "sliding_window": 8,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": true,
+            "layer_types": [
+                "sliding_attention", "sliding_attention",
+                "sliding_attention", "full_attention"
+            ],
+            "enable_moe_block": true,
+            "num_experts": 8,
+            "top_k_experts": 2,
+            "moe_intermediate_size": 16,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn moe_decoder_forward_shape_round_trips() {
+        let cfg = synthetic_moe();
+        let vocab = cfg.vocab_size;
+        assert!(cfg.enable_moe_block);
+        let mut model = Model::new(cfg.clone()).unwrap();
+        let mut caches = make_caches(&cfg, CacheOptions::default());
+
+        // Prefill 5 tokens through the dual-branch (dense + experts) FFN.
+        let ids: Vec<i32> = (0..5).collect();
+        let inputs = Array::from_slice(&ids, &[1, 5]);
+        let logits = model
+            .forward(ModelInput {
+                inputs: &inputs,
+                mask: None,
+                cache: &mut caches,
+            })
+            .unwrap();
+        eval([&logits]).unwrap();
+        assert_eq!(logits.shape(), &[1, 5, vocab]);
+
+        // Decode one more token.
+        let next = Array::from_slice(&[7_i32], &[1, 1]);
+        let logits2 = model
+            .forward(ModelInput {
+                inputs: &next,
+                mask: None,
+                cache: &mut caches,
+            })
+            .unwrap();
+        eval([&logits2]).unwrap();
+        assert_eq!(logits2.shape(), &[1, 1, vocab]);
     }
 }

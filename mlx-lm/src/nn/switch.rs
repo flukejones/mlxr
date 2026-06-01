@@ -17,7 +17,7 @@ use mlx_rs::ops::{
 use mlx_rs::quantization::{MaybeQuantized, Quantizable};
 use mlx_rs::Array;
 
-use crate::activations::{swiglu, SwigluCache};
+use crate::activations::{geglu, swiglu, GegluCache, SwigluCache};
 use crate::error::Error;
 
 /// Index count above which tokens are pre-sorted by expert id so
@@ -175,6 +175,20 @@ pub struct SwigluActivation {
 impl SwitchActivation for SwigluActivation {
     fn activate(&mut self, gate: &Array, up: &Array) -> Result<Array, Error> {
         Ok(swiglu(&mut self.cache, gate, up)?)
+    }
+}
+
+/// `gelu_approx(gate) * up` — Gemma 4 MoE expert activation. Owns a
+/// compiled-graph cache, built once per layer and reused across decode
+/// steps.
+#[derive(Debug, Default, ModuleParameters)]
+pub struct GegluActivation {
+    cache: GegluCache,
+}
+
+impl SwitchActivation for GegluActivation {
+    fn activate(&mut self, gate: &Array, up: &Array) -> Result<Array, Error> {
+        Ok(geglu(&mut self.cache, gate, up)?)
     }
 }
 

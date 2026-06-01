@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod cache;
 pub mod config;
+pub mod moe;
 pub mod rope;
 #[allow(
     clippy::module_inception,

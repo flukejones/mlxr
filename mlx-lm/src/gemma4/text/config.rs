@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::family::EosSpec;
+#[cfg(feature = "image")]
+use crate::gemma4::image::config::VisionConfig;
 use crate::utils::rope::FloatOrString;
 
 /// Gemma 4 envelope of `config.json`. Stored inside
@@ -24,6 +26,28 @@ pub struct ModelConfig {
     /// Optional explicit EOS token(s): a single id or a list.
     #[serde(default)]
     pub eos_token_id: Option<EosSpec>,
+
+    /// Present on VLM checkpoints (`gemma-4-*-it`); absent on text-only.
+    #[cfg(feature = "image")]
+    pub vision_config: Option<VisionConfig>,
+    /// Placeholder token each `<image>` expands to (one per soft token).
+    #[serde(default = "default_image_token_id")]
+    pub image_token_id: u32,
+    /// Begin/end-of-image marker tokens wrapping the placeholder block.
+    #[serde(default = "default_boi_token_id")]
+    pub boi_token_id: u32,
+    #[serde(default = "default_eoi_token_id")]
+    pub eoi_token_id: u32,
+}
+
+const fn default_image_token_id() -> u32 {
+    258880
+}
+const fn default_boi_token_id() -> u32 {
+    255999
+}
+const fn default_eoi_token_id() -> u32 {
+    258882
 }
 
 #[derive(Debug, Clone, Deserialize)]

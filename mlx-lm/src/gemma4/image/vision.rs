@@ -349,14 +349,13 @@ impl VisionEncoderLayer {
     }
 }
 
-/// Average-pool the patch grid to `default_output_length` soft tokens, scaled
-/// by `√hidden_size`. The grid is `pooling_kernel_size`-divisible (the
-/// processor guarantees it), so the `[B, ph/k, k, pw/k, k, H]` reshape-mean is
-/// exact.
+/// Average-pool the `k×k` patch grid, scaled by `√hidden_size`, yielding
+/// `(ph/k)·(pw/k)` soft tokens (the real count, no padding — the processor
+/// resizes to a `pooling_kernel_size`-divisible grid so the
+/// `[B, ph/k, k, pw/k, k, H]` reshape-mean is exact).
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct VisionPooler {
     kernel: i32,
-    default_output_length: i32,
     root_hidden: f32,
 }
 
@@ -364,12 +363,11 @@ impl VisionPooler {
     pub fn new(cfg: &VisionConfig) -> Self {
         Self {
             kernel: cfg.pooling_kernel_size,
-            default_output_length: cfg.default_output_length,
             root_hidden: (cfg.hidden_size as f32).sqrt(),
         }
     }
 
-    /// `states [B, ph*pw, H]` → `[B, default_output_length, H]`.
+    /// `states [B, ph*pw, H]` → `[B, (ph/k)*(pw/k), H]`.
     pub fn forward(&self, states: &Array, grid: &PatchGrid) -> Result<Array, Error> {
         let shape = states.shape();
         let (b, hidden) = (shape[0], shape[2]);
@@ -381,12 +379,6 @@ impl VisionPooler {
             )));
         }
         let pooled_len = (grid.ph / k) * (grid.pw / k);
-        if pooled_len != self.default_output_length {
-            return Err(Error::shape(format!(
-                "VisionPooler: pooled length {pooled_len} != default_output_length {}",
-                self.default_output_length
-            )));
-        }
         let r = reshape(states, &[b, grid.ph / k, k, grid.pw / k, k, hidden])?;
         let r = r.mean_axes(&[2, 4], false)?;
         let r = reshape(&r, &[b, pooled_len, hidden])?;
@@ -435,13 +427,15 @@ impl VisionModel {
         })
     }
 
-    /// `pixel_values [B, C, H, W]` (B=1) → `[B, default_output_length,
-    /// hidden_size]`. `H`/`W` must be `patch_size`-divisible.
+    /// `pixel_values [B, C, H, W]` (B=1) → `[B, (ph/k)*(pw/k), hidden_size]`.
+    /// `H`/`W` must be `patch_size`-divisible. Standardize runs *after* the
+    /// pooler's `√hidden` scaling (the bias is per-token, not per-patch).
     pub fn forward(&mut self, pixel_values: &Array, grid: PatchGrid) -> Result<Array, Error> {
         let mut h = self.patch_embedder.forward(pixel_values, grid.clone())?;
         for layer in &mut self.encoder {
             h = layer.forward(&h, &grid)?;
         }
+        h = self.pooler.forward(&h, &grid)?;
         if self.standardize {
             let bias = self
                 .std_bias
@@ -458,7 +452,7 @@ impl VisionModel {
                 .subtract(&bias.as_dtype(dt)?)?
                 .multiply(&scale.as_dtype(dt)?)?;
         }
-        self.pooler.forward(&h, &grid)
+        Ok(h)
     }
 }
 

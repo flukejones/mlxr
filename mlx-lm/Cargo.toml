@@ -42,6 +42,12 @@ default = ["image"]
 # qwen3.5 image subtree, the `Image`/`ProcessedImage` input surface, and
 # the VLM dispatch path. Off = text-only build, no codec dependency.
 image = ["dep:image"]
+# Audio (gemma4 USM Conformer) support: compiles the gemma4 audio subtree
+# + the audio input surface. Opt-in; off = audio keys dropped at load so
+# e2b/e4b still load text+vision. Implies `image`: gemma4 audio checkpoints
+# are multimodal (vision + audio) and the VLM loader/adapter live in the
+# image subtree, reusing its masked-scatter stitch.
+audio = ["image"]
 
 [dev-dependencies]
 lazy_static = "1"

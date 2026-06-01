@@ -19,6 +19,11 @@ pub struct LMInput {
     /// text-only requests or models that don't accept images.
     #[cfg(feature = "image")]
     pub image: Option<ProcessedImage>,
+
+    /// Pre-processed log-mel audio for the audio tower. `None` for
+    /// text/image-only requests or models that don't accept audio.
+    #[cfg(feature = "audio")]
+    pub audio: Option<ProcessedAudio>,
 }
 
 /// Tokenised text portion of an [`LMInput`].
@@ -43,6 +48,14 @@ pub struct ProcessedImage {
 
     /// One `[t, h, w]` patch-grid per image, in `UserInput::images` order.
     pub grids: Vec<[i32; 3]>,
+}
+
+/// Pre-processed log-mel audio, ready for the model's audio tower.
+#[cfg(feature = "audio")]
+#[derive(Debug)]
+pub struct ProcessedAudio {
+    /// `[1, T, 128]` `f32` log-mel features (one clip per turn).
+    pub mel: Array,
 }
 
 /// Result of [`crate::LanguageModel::prepare`]: logits to sample now, or

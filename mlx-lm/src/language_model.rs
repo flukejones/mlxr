@@ -151,6 +151,8 @@ impl UserInputProcessor for TextOnlyProcessor {
             text: Text { tokens, mask: None },
             #[cfg(feature = "image")]
             image: None,
+            #[cfg(feature = "audio")]
+            audio: None,
         })
     }
 

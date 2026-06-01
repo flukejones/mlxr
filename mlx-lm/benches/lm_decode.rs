@@ -149,6 +149,8 @@ fn lm_input(prompt: &Array) -> LMInput {
         },
         #[cfg(feature = "image")]
         image: None,
+        #[cfg(feature = "audio")]
+        audio: None,
     }
 }
 

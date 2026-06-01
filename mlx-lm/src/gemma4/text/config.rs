@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::family::EosSpec;
+#[cfg(feature = "audio")]
+use crate::gemma4::audio::config::AudioConfig;
 #[cfg(feature = "image")]
 use crate::gemma4::image::config::VisionConfig;
 use crate::utils::rope::FloatOrString;
@@ -38,6 +40,18 @@ pub struct ModelConfig {
     pub boi_token_id: u32,
     #[serde(default = "default_eoi_token_id")]
     pub eoi_token_id: u32,
+
+    /// Present on e2b/e4b checkpoints (audio tower); absent otherwise.
+    #[cfg(feature = "audio")]
+    pub audio_config: Option<AudioConfig>,
+    /// Placeholder token each `<audio>` expands to (one per soft token).
+    #[serde(default = "default_audio_token_id")]
+    pub audio_token_id: u32,
+    /// Begin/end-of-audio marker tokens wrapping the placeholder block.
+    #[serde(default = "default_boa_token_id")]
+    pub boa_token_id: u32,
+    #[serde(default = "default_eoa_token_id")]
+    pub eoa_token_id: u32,
 }
 
 const fn default_image_token_id() -> u32 {
@@ -48,6 +62,15 @@ const fn default_boi_token_id() -> u32 {
 }
 const fn default_eoi_token_id() -> u32 {
     258882
+}
+const fn default_audio_token_id() -> u32 {
+    258881
+}
+const fn default_boa_token_id() -> u32 {
+    256000
+}
+const fn default_eoa_token_id() -> u32 {
+    258883
 }
 
 #[derive(Debug, Clone, Deserialize)]

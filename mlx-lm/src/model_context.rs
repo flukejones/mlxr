@@ -341,6 +341,8 @@ fn run_prefill(model: &mut dyn LanguageModel, mut input: LMInput) -> Result<Arra
                 text: Text { tokens: tail, mask },
                 #[cfg(feature = "image")]
                 image: None,
+                #[cfg(feature = "audio")]
+                audio: None,
             };
         }
     }
@@ -377,6 +379,8 @@ mod tests {
                 },
                 #[cfg(feature = "image")]
                 image: None,
+                #[cfg(feature = "audio")]
+                audio: None,
             })
         }
         fn decode(&self, ids: &[u32]) -> Result<String, Error> {

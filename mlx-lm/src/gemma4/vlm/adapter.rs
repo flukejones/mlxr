@@ -19,13 +19,17 @@ use crate::chat_template::{ChatMessage, ChatTemplate, ContentPart, MessageConten
 use crate::config::ModelConfig as Config;
 use crate::error::Error;
 use crate::family::{EosSpec, LoadedContext};
+#[cfg(feature = "audio")]
+use crate::gemma4::audio::encoder::{AudioEncoder, EmbedAudio};
+#[cfg(feature = "audio")]
+use crate::gemma4::audio::multimodal::stitch_audio_features;
 use crate::gemma4::image::multimodal::stitch_image_features;
 use crate::gemma4::image::processor::Gemma4ImageProcessor;
 use crate::gemma4::image::vision::{EmbedVision, PatchGrid, VisionModel};
 use crate::gemma4::text::cache::{make_caches, LayerCache};
 use crate::gemma4::text::config::{ModelConfig, TextConfig};
 use crate::gemma4::text::text::Model;
-use crate::gemma4::vlm::weights::load_full_model;
+use crate::gemma4::vlm::weights::{load_full_model, LoadedTowers};
 use crate::language_model::{LanguageModel, UserInputProcessor};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult, ProcessedImage, Text};
 use crate::loader::{load_tokenizer, resolve_bos_id};
@@ -39,20 +43,26 @@ pub(crate) struct Gemma4VlmAdapter {
     model: Model,
     vision: VisionModel,
     embed_vision: EmbedVision,
+    #[cfg(feature = "audio")]
+    audio: Option<(AudioEncoder, EmbedAudio)>,
     cache: Vec<Option<LayerCache>>,
     args: TextConfig,
     image_token_id: u32,
+    #[cfg(feature = "audio")]
+    audio_token_id: u32,
     cache_options: CacheOptions,
     vocab_size: i32,
 }
 
 impl Gemma4VlmAdapter {
-    fn new(
-        model: Model,
-        vision: VisionModel,
-        embed_vision: EmbedVision,
-        env: &ModelConfig,
-    ) -> Self {
+    fn new(towers: LoadedTowers, env: &ModelConfig) -> Self {
+        let LoadedTowers {
+            text: model,
+            vision,
+            embed_vision,
+            #[cfg(feature = "audio")]
+            audio,
+        } = towers;
         let args = model.args.clone();
         let vocab_size = args.vocab_size;
         let cache_options = CacheOptions::default();
@@ -61,9 +71,13 @@ impl Gemma4VlmAdapter {
             model,
             vision,
             embed_vision,
+            #[cfg(feature = "audio")]
+            audio,
             cache,
             args,
             image_token_id: env.image_token_id,
+            #[cfg(feature = "audio")]
+            audio_token_id: env.audio_token_id,
             cache_options,
             vocab_size,
         }
@@ -86,6 +100,20 @@ impl Gemma4VlmAdapter {
         }
         Ok(concatenate_axis(&feats, 0)?)
     }
+
+    /// Run the audio tower + projector over `[1, T, 128]` log-mel → soft tokens
+    /// `[T', text_hidden]`.
+    #[cfg(feature = "audio")]
+    fn encode_audio(&mut self, mel: &Array) -> Result<Array, Error> {
+        let (enc, embed) = self
+            .audio
+            .as_mut()
+            .ok_or_else(|| Error::config("gemma4 audio: checkpoint has no audio tower"))?;
+        let features = enc.forward(mel)?;
+        let projected = embed.forward(&features)?;
+        let shape = projected.shape();
+        Ok(projected.reshape(&[shape[1], shape[2]])?)
+    }
 }
 
 impl LanguageModel for Gemma4VlmAdapter {
@@ -94,31 +122,49 @@ impl LanguageModel for Gemma4VlmAdapter {
     }
 
     fn prepare(&mut self, input: LMInput) -> Result<PrepareResult, Error> {
-        let Some(image) = input.image else {
+        let image = input.image;
+        #[cfg(feature = "audio")]
+        let audio = input.audio;
+        #[cfg(not(feature = "audio"))]
+        let audio: Option<()> = None;
+
+        // No modality attached → plain text decode.
+        if image.is_none() && audio.is_none() {
             let logits = self.model.forward(ModelInput {
                 inputs: &input.text.tokens,
                 mask: None,
                 cache: &mut self.cache,
             })?;
             return Ok(PrepareResult::Logits(logits.index((.., -1, ..))));
-        };
+        }
 
-        let image_features = self.encode_images(&image.pixels, image.grids.as_slice())?;
         let input_ids = input.text.tokens;
 
         // Per-layer inputs index `embed_tokens_per_layer` with the ids, so the
-        // image-token slots must map to a real id (0) — mirrors the reference
-        // masking before `get_per_layer_inputs`.
-        let is_image = input_ids.eq(Array::from_int(self.image_token_id as i32))?;
+        // image/audio token slots must map to a real id (0) — mirrors the
+        // reference masking before `get_per_layer_inputs`.
         let zeros = Array::from_int(0).as_dtype(input_ids.dtype())?;
-        let masked_ids = r#where(&is_image, &zeros, &input_ids)?;
+        let is_image = input_ids.eq(Array::from_int(self.image_token_id as i32))?;
+        #[cfg(feature = "audio")]
+        let is_special =
+            is_image.logical_or(&input_ids.eq(Array::from_int(self.audio_token_id as i32))?)?;
+        #[cfg(not(feature = "audio"))]
+        let is_special = is_image;
+        let masked_ids = r#where(&is_special, &zeros, &input_ids)?;
 
-        let embeds = self.model.model.embed_scaled(&masked_ids)?;
-        let stitched =
-            stitch_image_features(&image_features, &embeds, &input_ids, self.image_token_id)?;
+        let mut embeds = self.model.model.embed_scaled(&masked_ids)?;
+        if let Some(image) = image {
+            let features = self.encode_images(&image.pixels, image.grids.as_slice())?;
+            embeds = stitch_image_features(&features, &embeds, &input_ids, self.image_token_id)?;
+        }
+        #[cfg(feature = "audio")]
+        if let Some(audio) = audio {
+            let features = self.encode_audio(&audio.mel)?;
+            embeds = stitch_audio_features(&features, &embeds, &input_ids, self.audio_token_id)?;
+        }
         let logits = self
             .model
-            .forward_embeds(stitched, &masked_ids, &mut self.cache)?;
+            .forward_embeds(embeds, &masked_ids, &mut self.cache)?;
         Ok(PrepareResult::Logits(logits.index((.., -1, ..))))
     }
 
@@ -256,6 +302,10 @@ impl UserInputProcessor for Gemma4Processor {
         Ok(LMInput {
             text: Text { tokens, mask: None },
             image,
+            // The image processor never produces audio; the `--audio` path
+            // (commit 2) builds its own LMInput.
+            #[cfg(feature = "audio")]
+            audio: None,
         })
     }
 
@@ -337,7 +387,7 @@ pub(crate) fn load_context_vlm(
         .vision_config
         .as_ref()
         .ok_or_else(|| Error::config("gemma4 vlm: config has no vision_config"))?;
-    let (model, vision, embed_vision) = load_full_model(cfg, env, vision_cfg, dir)?;
+    let towers = load_full_model(cfg, env, vision_cfg, dir)?;
 
     let tokenizer = load_tokenizer(dir)?;
     let bos_id = resolve_bos_id(dir, &tokenizer);
@@ -347,7 +397,7 @@ pub(crate) fn load_context_vlm(
 
     let pooling_kernel_size = image_processor.config.pooling_kernel_size;
     let patch_size = image_processor.config.patch_size;
-    let adapter = Gemma4VlmAdapter::new(model, vision, embed_vision, env);
+    let adapter = Gemma4VlmAdapter::new(towers, env);
     let processor = Gemma4Processor {
         tokenizer,
         chat_template,

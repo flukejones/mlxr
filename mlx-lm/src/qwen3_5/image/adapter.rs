@@ -62,6 +62,8 @@ impl LanguageModel for Qwen35VlmAdapter {
             return self.dense.prepare(LMInput {
                 text: input.text,
                 image: None,
+                #[cfg(feature = "audio")]
+                audio: None,
             });
         };
 
@@ -246,6 +248,8 @@ impl UserInputProcessor for Qwen35Processor {
         Ok(LMInput {
             text: Text { tokens, mask: None },
             image,
+            #[cfg(feature = "audio")]
+            audio: None,
         })
     }
 

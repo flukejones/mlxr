@@ -8,6 +8,8 @@ use crate::config::ModelConfig;
 use crate::error::Error;
 use crate::family::LoadedContext;
 
+#[cfg(feature = "audio")]
+pub mod audio;
 #[cfg(feature = "image")]
 pub mod image;
 pub mod text;

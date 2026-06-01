@@ -210,7 +210,7 @@ fn geglu_inner((gate, up): (&Array, &Array)) -> Result<Array, Exception> {
 /// forward (residual → next layer → expert `gather_qmm` in f32), which is
 /// ~4× slower at decode. Staging the scalars into the input dtype keeps
 /// the graph in-place.
-fn gelu_approximate_in_dtype(x: &Array) -> Result<Array, Exception> {
+pub(crate) fn gelu_approximate_in_dtype(x: &Array) -> Result<Array, Exception> {
     let dt = x.dtype();
     let cast = |c: f32| -> Result<Array, Exception> { Array::from_f32(c).as_dtype(dt) };
     let half = cast(0.5)?;

@@ -80,9 +80,15 @@ impl KeyValueCache for LayerCache {
 /// kinds: full-attention → dense [`FullAttnCache`], sliding-attention →
 /// [`RotatingKVCache`] of `sliding_window` capacity (no keep prefix).
 pub fn make_caches(args: &TextConfig, opts: CacheOptions) -> Vec<Option<LayerCache>> {
+    // KV-shared layers own no cache (reuse a prior layer's K/V) → `None`.
+    let first_kv_shared = args.num_hidden_layers - args.num_kv_shared_layers;
     args.layer_types_resolved()
         .into_iter()
-        .map(|kind| {
+        .enumerate()
+        .map(|(i, kind)| {
+            if args.num_kv_shared_layers > 0 && i as i32 >= first_kv_shared {
+                return None;
+            }
             Some(match kind {
                 LayerKind::FullAttention => LayerCache::Global(FullAttnCache::from_options(opts)),
                 LayerKind::SlidingAttention => {

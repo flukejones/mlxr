@@ -5,18 +5,21 @@
 //! MoE expert routing, per-layer-input embeddings (E2B/E4B), and KV
 //! sharing are deferred; each extends this base at its own consumer.
 
+use std::collections::HashMap;
+
 use mlx_rs::{
     builder::Builder,
     macros::{ModuleParameters, Quantizable},
     module::{Module, Param},
     nn,
-    ops::{clip, expand_dims_axes},
+    ops::{clip, expand_dims_axes, indexing::IndexOp, unflatten},
     quantization::MaybeQuantized,
     Array, Dtype,
 };
 
 use crate::activations::{
-    geglu, logit_softcap, residual_add_scale, GegluCache, LogitSoftcapCache, ResidualAddScaleCache,
+    geglu, gelu_approximate_in_dtype, logit_softcap, residual_add_scale, GegluCache,
+    LogitSoftcapCache, ResidualAddScaleCache,
 };
 use crate::cache::KeyValueCache;
 use crate::error::Error;
@@ -56,6 +59,8 @@ pub struct Attention {
     pub layer_kind: LayerKind,
     pub is_sliding: bool,
     pub use_k_eq_v: bool,
+    /// `false` for KV-shared layers (reuse a prior layer's K/V).
+    pub has_kv: bool,
 
     pub n_heads: i32,
     pub n_kv_heads: i32,
@@ -65,10 +70,10 @@ pub struct Attention {
     #[quantizable]
     #[param]
     pub q_proj: MaybeQuantized<nn::Linear>,
+    /// `None` on KV-shared layers; also `None` for v_proj when K == V.
     #[quantizable]
     #[param]
-    pub k_proj: MaybeQuantized<nn::Linear>,
-    /// `None` when K == V (full-attention layers with `attention_k_eq_v`).
+    pub k_proj: Option<MaybeQuantized<nn::Linear>>,
     #[quantizable]
     #[param]
     pub v_proj: Option<MaybeQuantized<nn::Linear>>,
@@ -79,9 +84,9 @@ pub struct Attention {
     #[param]
     pub q_norm: nn::RmsNorm,
     #[param]
-    pub k_norm: nn::RmsNorm,
+    pub k_norm: Option<nn::RmsNorm>,
     #[param]
-    pub v_norm: RmsNormNoScale,
+    pub v_norm: Option<RmsNormNoScale>,
 
     #[param]
     pub rope: LayerRope,
@@ -100,6 +105,9 @@ impl Attention {
             args.head_dim
         };
 
+        let first_kv_shared = args.num_hidden_layers - args.num_kv_shared_layers;
+        let has_kv = layer_idx < first_kv_shared;
+
         let use_k_eq_v = args.attention_k_eq_v && !is_sliding;
         let n_kv_heads = match (use_k_eq_v, args.num_global_key_value_heads) {
             (true, Some(h)) => h,
@@ -114,11 +122,16 @@ impl Attention {
             ))
         };
         let q_proj = linear(dim, n_heads * head_dim)?;
-        let k_proj = linear(dim, n_kv_heads * head_dim)?;
-        let v_proj = if use_k_eq_v {
-            None
+        let (k_proj, v_proj) = if has_kv {
+            let k = linear(dim, n_kv_heads * head_dim)?;
+            let v = if use_k_eq_v {
+                None
+            } else {
+                Some(linear(dim, n_kv_heads * head_dim)?)
+            };
+            (Some(k), v)
         } else {
-            Some(linear(dim, n_kv_heads * head_dim)?)
+            (None, None)
         };
         let o_proj = linear(n_heads * head_dim, dim)?;
 
@@ -126,8 +139,14 @@ impl Attention {
             Ok(nn::RmsNormBuilder::new(d).eps(args.rms_norm_eps).build()?)
         };
         let q_norm = norm(head_dim)?;
-        let k_norm = norm(head_dim)?;
-        let v_norm = RmsNormNoScale::new(args.rms_norm_eps);
+        let (k_norm, v_norm) = if has_kv {
+            (
+                Some(norm(head_dim)?),
+                Some(RmsNormNoScale::new(args.rms_norm_eps)),
+            )
+        } else {
+            (None, None)
+        };
 
         let rope = build_layer_rope(
             head_dim,
@@ -141,6 +160,7 @@ impl Attention {
             layer_kind,
             is_sliding,
             use_k_eq_v,
+            has_kv,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -193,11 +213,24 @@ impl Attention {
         let (keys, values) = if let Some(kv) = shared_kv {
             kv
         } else {
+            if !self.has_kv {
+                return Err(Error::config(format!(
+                    "gemma4: layer {} is KV-shared but no shared_kv supplied",
+                    self.layer_idx
+                )));
+            }
             let keys = self
                 .k_proj
+                .as_mut()
+                .expect("has_kv guarantees k_proj")
                 .forward(x)?
                 .reshape(&[B, L, self.n_kv_heads, self.head_dim])?;
-            let k_for_attn = self.k_norm.forward(&keys)?.transpose_axes(&[0, 2, 1, 3])?;
+            let k_for_attn = self
+                .k_norm
+                .as_mut()
+                .expect("has_kv guarantees k_norm")
+                .forward(&keys)?
+                .transpose_axes(&[0, 2, 1, 3])?;
             let k_for_attn = self.rope.forward_dynamic(&k_for_attn, &pre_offset_arr)?;
 
             let values = if self.use_k_eq_v {
@@ -211,6 +244,8 @@ impl Attention {
             };
             let v_for_attn = self
                 .v_norm
+                .as_mut()
+                .expect("has_kv guarantees v_norm")
                 .forward(&values)?
                 .transpose_axes(&[0, 2, 1, 3])?;
 
@@ -248,14 +283,20 @@ impl Attention {
 
     pub fn training_mode_set(&mut self, mode: bool) {
         self.q_proj.training_mode(mode);
-        self.k_proj.training_mode(mode);
+        if let Some(k) = self.k_proj.as_mut() {
+            k.training_mode(mode);
+        }
         if let Some(v) = self.v_proj.as_mut() {
             v.training_mode(mode);
         }
         self.o_proj.training_mode(mode);
         self.q_norm.training_mode(mode);
-        self.k_norm.training_mode(mode);
-        self.v_norm.training_mode(mode);
+        if let Some(k) = self.k_norm.as_mut() {
+            k.training_mode(mode);
+        }
+        if let Some(v) = self.v_norm.as_mut() {
+            v.training_mode(mode);
+        }
     }
 }
 
@@ -274,16 +315,17 @@ pub struct Mlp {
 }
 
 impl Mlp {
-    pub fn new(args: &TextConfig) -> Result<Self, Error> {
+    /// `intermediate_size` is the effective width (doubled for double-wide layers).
+    pub fn new(args: &TextConfig, intermediate_size: i32) -> Result<Self, Error> {
         let linear = |inp: i32, out: i32| -> Result<MaybeQuantized<nn::Linear>, Error> {
             Ok(MaybeQuantized::Original(
                 nn::LinearBuilder::new(inp, out).bias(false).build()?,
             ))
         };
         Ok(Self {
-            gate_proj: linear(args.hidden_size, args.intermediate_size)?,
-            down_proj: linear(args.intermediate_size, args.hidden_size)?,
-            up_proj: linear(args.hidden_size, args.intermediate_size)?,
+            gate_proj: linear(args.hidden_size, intermediate_size)?,
+            down_proj: linear(intermediate_size, args.hidden_size)?,
+            up_proj: linear(args.hidden_size, intermediate_size)?,
             geglu_cache: GegluCache::default(),
         })
     }
@@ -360,6 +402,17 @@ pub struct DecoderLayer {
     #[param]
     pub post_feedforward_layernorm_2: Option<nn::RmsNorm>,
 
+    /// Per-layer-input gating (`Some` iff per-layer-input on):
+    /// `h += post_norm(proj(gelu(gate(h)) * per_layer_input))`.
+    #[quantizable]
+    #[param]
+    pub per_layer_input_gate: Option<MaybeQuantized<nn::Linear>>,
+    #[quantizable]
+    #[param]
+    pub per_layer_projection: Option<MaybeQuantized<nn::Linear>>,
+    #[param]
+    pub post_per_layer_input_norm: Option<nn::RmsNorm>,
+
     /// Multiplicative per-layer scalar on the residual stream.
     #[param]
     pub layer_scalar: Param<Array>,
@@ -408,12 +461,41 @@ impl DecoderLayer {
             (None, None, None, None, None)
         };
 
+        let pl = args.hidden_size_per_layer_input;
+        let (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm) = if pl > 0 {
+            let linear = |inp: i32, out: i32| -> Result<MaybeQuantized<nn::Linear>, Error> {
+                Ok(MaybeQuantized::Original(
+                    nn::LinearBuilder::new(inp, out).bias(false).build()?,
+                ))
+            };
+            (
+                Some(linear(args.hidden_size, pl)?),
+                Some(linear(pl, args.hidden_size)?),
+                Some(
+                    nn::RmsNormBuilder::new(args.hidden_size)
+                        .eps(args.rms_norm_eps)
+                        .build()?,
+                ),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        // Double-wide dense MLP on KV-shared layers (E2B).
+        let first_kv_shared = args.num_hidden_layers - args.num_kv_shared_layers;
+        let is_kv_shared = layer_idx >= first_kv_shared && args.num_kv_shared_layers > 0;
+        let mlp_intermediate = if args.use_double_wide_mlp && is_kv_shared {
+            args.intermediate_size * 2
+        } else {
+            args.intermediate_size
+        };
+
         Ok(Self {
             layer_idx,
             layer_kind,
             enable_moe,
             self_attn: Attention::new(args, layer_idx)?,
-            mlp: Mlp::new(args)?,
+            mlp: Mlp::new(args, mlp_intermediate)?,
             router,
             experts,
             input_layernorm: norm()?,
@@ -423,6 +505,9 @@ impl DecoderLayer {
             post_feedforward_layernorm_1: post_ff_1,
             pre_feedforward_layernorm_2: pre_ff_2,
             post_feedforward_layernorm_2: post_ff_2,
+            per_layer_input_gate,
+            per_layer_projection,
+            post_per_layer_input_norm,
             layer_scalar: Param::new(Array::ones::<f32>(&[1])?),
             residual_scale_cache: ResidualAddScaleCache::default(),
         })
@@ -496,23 +581,43 @@ impl DecoderLayer {
         // Both branches share the final post-norm before the residual add.
         let ff_out = self.post_feedforward_layernorm.forward(&ff_mid)?;
 
-        // `per_layer_input` is the E2B/E4B gating hook; unused in the dense +
-        // MoE base (the per-layer gate/proj/norm fields land with that
-        // extension). The arg keeps `forward_layer`'s signature stable.
-        let _ = per_layer_input;
+        // Per-layer-input gating sits between the FFN residual and the
+        // layer-scalar multiply, so it forces the unfused path.
+        let pl_active = per_layer_input.is_some()
+            && self.per_layer_input_gate.is_some()
+            && self.per_layer_projection.is_some()
+            && self.post_per_layer_input_norm.is_some();
 
-        // bf16/fp32: fuse `(h + ff_out) * layer_scalar`. fp16: clip then scale.
-        let out = if ff_out.dtype() != Dtype::Float16 {
-            residual_add_scale(
+        // bf16/fp32 + no per-layer gating: fuse `(h + ff_out) * layer_scalar`.
+        if !pl_active && ff_out.dtype() != Dtype::Float16 {
+            let out = residual_add_scale(
                 &mut self.residual_scale_cache,
                 &h,
                 &ff_out,
                 self.layer_scalar.as_ref(),
-            )?
-        } else {
-            let h = clip_residual(&h, &ff_out)?;
-            h.multiply(self.layer_scalar.as_ref())?
-        };
+            )?;
+            return Ok(AttentionOut {
+                h: out,
+                shared_kv: kv_out,
+                offset: off_out,
+            });
+        }
+
+        let mut h = clip_residual(&h, &ff_out)?;
+        if let (Some(gate_l), Some(proj_l), Some(norm_l), Some(pl_in)) = (
+            self.per_layer_input_gate.as_mut(),
+            self.per_layer_projection.as_mut(),
+            self.post_per_layer_input_norm.as_mut(),
+            per_layer_input,
+        ) {
+            let g = gate_l.forward(&h)?;
+            let g = gelu_approximate_in_dtype(&g)?;
+            let g = g.multiply(pl_in)?;
+            let g = proj_l.forward(&g)?;
+            let g = norm_l.forward(&g)?;
+            h = h.add(&g)?;
+        }
+        let out = h.multiply(self.layer_scalar.as_ref())?;
         Ok(AttentionOut {
             h: out,
             shared_kv: kv_out,
@@ -537,9 +642,27 @@ pub struct Gemma4TextModel {
     pub embed_scale: f32,
     embed_scale_arr: std::sync::OnceLock<Array>,
 
+    /// 0 disables the per-layer-input path.
+    pub hidden_size_per_layer_input: i32,
+    embed_tokens_per_layer_scale: f32,
+    per_layer_input_scale: f32,
+    per_layer_projection_scale: f32,
+    embed_tokens_per_layer_scale_arr: std::sync::OnceLock<Array>,
+    per_layer_input_scale_arr: std::sync::OnceLock<Array>,
+    per_layer_projection_scale_arr: std::sync::OnceLock<Array>,
+    /// `previous_kvs[j]` = the layer whose K/V layer `j` reuses (`== j` if not shared).
+    pub previous_kvs: Vec<usize>,
+
     #[quantizable]
     #[param]
     pub embed_tokens: MaybeQuantized<nn::Embedding>,
+    #[quantizable]
+    #[param]
+    pub embed_tokens_per_layer: Option<MaybeQuantized<nn::Embedding>>,
+    #[param]
+    pub per_layer_model_projection: Option<nn::Linear>,
+    #[param]
+    pub per_layer_projection_norm: Option<nn::RmsNorm>,
     #[quantizable]
     #[param]
     pub layers: Vec<DecoderLayer>,
@@ -547,20 +670,74 @@ pub struct Gemma4TextModel {
     pub norm: nn::RmsNorm,
 }
 
+/// Map each KV-shared layer to the most-recent same-kind owned layer it
+/// reuses K/V from. Identity for non-shared layers.
+fn compute_previous_kvs(args: &TextConfig) -> Vec<usize> {
+    let n = args.num_hidden_layers as usize;
+    let mut previous_kvs: Vec<usize> = (0..n).collect();
+    if args.num_kv_shared_layers <= 0 {
+        return previous_kvs;
+    }
+    let first_kv_shared = (args.num_hidden_layers - args.num_kv_shared_layers) as usize;
+    let layer_types = args.layer_types_resolved();
+    let mut kvs_by_kind: HashMap<LayerKind, usize> = HashMap::new();
+    for (i, k) in layer_types.iter().enumerate().take(first_kv_shared) {
+        kvs_by_kind.insert(*k, i);
+    }
+    for (j, slot) in previous_kvs.iter_mut().enumerate().skip(first_kv_shared) {
+        if let Some(&src) = kvs_by_kind.get(&layer_types[j]) {
+            *slot = src;
+        }
+    }
+    previous_kvs
+}
+
 impl Gemma4TextModel {
     pub fn new(args: &TextConfig) -> Result<Self, Error> {
         let layers = (0..args.num_hidden_layers)
             .map(|i| DecoderLayer::new(args, i))
             .collect::<Result<Vec<_>, _>>()?;
+
+        let pl = args.hidden_size_per_layer_input;
+        let (embed_tokens_per_layer, per_layer_model_projection, per_layer_projection_norm) =
+            if pl > 0 {
+                let wide = args.num_hidden_layers * pl;
+                (
+                    Some(MaybeQuantized::Original(nn::Embedding::new(
+                        args.vocab_size_per_layer_input,
+                        wide,
+                    )?)),
+                    Some(
+                        nn::LinearBuilder::new(args.hidden_size, wide)
+                            .bias(false)
+                            .build()?,
+                    ),
+                    Some(nn::RmsNormBuilder::new(pl).eps(args.rms_norm_eps).build()?),
+                )
+            } else {
+                (None, None, None)
+            };
+
         Ok(Self {
             vocab_size: args.vocab_size,
             sliding_window_pattern: args.effective_sliding_window_pattern(),
             embed_scale: (args.hidden_size as f32).sqrt(),
             embed_scale_arr: std::sync::OnceLock::new(),
+            hidden_size_per_layer_input: pl,
+            embed_tokens_per_layer_scale: if pl > 0 { (pl as f32).sqrt() } else { 0.0 },
+            per_layer_input_scale: (2.0_f32).powf(-0.5),
+            per_layer_projection_scale: (args.hidden_size as f32).powf(-0.5),
+            embed_tokens_per_layer_scale_arr: std::sync::OnceLock::new(),
+            per_layer_input_scale_arr: std::sync::OnceLock::new(),
+            per_layer_projection_scale_arr: std::sync::OnceLock::new(),
+            previous_kvs: compute_previous_kvs(args),
             embed_tokens: MaybeQuantized::Original(nn::Embedding::new(
                 args.vocab_size,
                 args.hidden_size,
             )?),
+            embed_tokens_per_layer,
+            per_layer_model_projection,
+            per_layer_projection_norm,
             layers,
             norm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -588,10 +765,55 @@ where
         });
         h = h.multiply(embed_scale_arr)?;
 
+        // Per-layer inputs `[B, L, num_layers, pl]`, sliced axis-2 per layer.
+        let per_layer_inputs: Option<Vec<Array>> = if self.hidden_size_per_layer_input > 0 {
+            let pl = self.hidden_size_per_layer_input;
+            let n = self.layers.len() as i32;
+            let etps = self.embed_tokens_per_layer_scale_arr.get_or_init(|| {
+                Array::from_f32(self.embed_tokens_per_layer_scale)
+                    .as_dtype(h_dtype)
+                    .expect("etpl scale cast cannot fail")
+            });
+            let pps = self.per_layer_projection_scale_arr.get_or_init(|| {
+                Array::from_f32(self.per_layer_projection_scale)
+                    .as_dtype(h_dtype)
+                    .expect("pl proj scale cast cannot fail")
+            });
+            let pis = self.per_layer_input_scale_arr.get_or_init(|| {
+                Array::from_f32(self.per_layer_input_scale)
+                    .as_dtype(h_dtype)
+                    .expect("pl input scale cast cannot fail")
+            });
+            let etpl = self
+                .embed_tokens_per_layer
+                .as_mut()
+                .expect("hidden_size_per_layer_input>0 has embed_tokens_per_layer");
+            let pli = etpl.forward(inputs)?.multiply(etps)?;
+            let pli = unflatten(&pli, -1, &[n, pl])?;
+
+            let proj = self
+                .per_layer_model_projection
+                .as_mut()
+                .expect("hidden_size_per_layer_input>0 has per_layer_model_projection");
+            let pproj = proj.forward(&h)?.multiply(pps)?;
+            let pproj = unflatten(&pproj, -1, &[n, pl])?;
+            let pproj = self
+                .per_layer_projection_norm
+                .as_mut()
+                .expect("hidden_size_per_layer_input>0 has per_layer_projection_norm")
+                .forward(&pproj)?;
+
+            let combined = pproj.add(&pli)?.multiply(pis)?;
+            Some((0..n).map(|i| combined.index((.., .., i, ..))).collect())
+        } else {
+            None
+        };
+
         // Per-layer-kind masks: full-attn uses the global cache slot, sliding
         // uses slot 0 (a Sliding cache whose max_size bounds the window).
         // `return_array=Some(true)` forces explicit Array masks (the sliding
-        // window restriction needs the array form).
+        // window restriction needs the array form). `global_idx` and slot 0
+        // are owned layers (shared `None` slots are the trailing layers).
         let pattern = self.sliding_window_pattern as usize;
         let global_idx = pattern.saturating_sub(1).min(cache.len().saturating_sub(1));
         let global_mask = mask_array(create_attention_mask(
@@ -605,16 +827,33 @@ where
             None
         };
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        // `intermediates[i]` holds each layer's `(k, v, offset)` so a shared
+        // layer (`previous_kvs[i] != i`) can reuse its source's. Split-borrow
+        // avoids cloning the index table per step.
+        let previous_kvs = self.previous_kvs.as_slice();
+        let layers = &mut self.layers;
+        let mut intermediates: Vec<Option<(Array, Array, i32)>> = vec![None; layers.len()];
+
+        for (i, layer) in layers.iter_mut().enumerate() {
             let mask = match layer.layer_kind {
                 LayerKind::FullAttention => global_mask.as_ref(),
                 LayerKind::SlidingAttention => sliding_mask.as_ref(),
             };
             let cache_slot = cache.get_mut(i).and_then(|c| c.as_mut());
-            // KV-sharing + per-layer-input are E2B/E4B extensions; the dense
-            // and MoE base pass None.
-            let out = layer.forward_layer(&h, mask, cache_slot, None, None, None)?;
+
+            let (shared_kv, offset_in) = if previous_kvs[i] != i {
+                match &intermediates[previous_kvs[i]] {
+                    Some((k, v, off)) => (Some((k.clone(), v.clone())), Some(*off)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+            let pli = per_layer_inputs.as_ref().map(|v| &v[i]);
+
+            let out = layer.forward_layer(&h, mask, cache_slot, shared_kv, offset_in, pli)?;
             h = out.h;
+            intermediates[i] = Some((out.shared_kv.0, out.shared_kv.1, out.offset));
         }
 
         Ok(self.norm.forward(&h)?)
@@ -891,5 +1130,79 @@ mod tests {
             .unwrap();
         eval([&logits2]).unwrap();
         assert_eq!(logits2.shape(), &[1, 1, vocab]);
+    }
+
+    /// `synthetic()` + per-layer-input + KV-sharing (last 2 of 4 shared).
+    fn synthetic_e2b() -> TextConfig {
+        let json = serde_json::json!({
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "head_dim": 8,
+            "global_head_dim": 8,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 100,
+            "sliding_window": 8,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": true,
+            // full-attn at idx 1 (owned) so shared sliding layers 2,3 have a
+            // same-kind source (layer 0).
+            "layer_types": [
+                "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention"
+            ],
+            "hidden_size_per_layer_input": 16,
+            "vocab_size_per_layer_input": 100,
+            "num_kv_shared_layers": 2,
+            "use_double_wide_mlp": true,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn e2b_decoder_forward_shape_round_trips() {
+        let cfg = synthetic_e2b();
+        let vocab = cfg.vocab_size;
+        // Layers 0-1 own K/V; layers 2-3 are KV-shared (None cache slots).
+        assert_eq!(cfg.num_kv_shared_layers, 2);
+        let mut model = Model::new(cfg.clone()).unwrap();
+        let mut caches = make_caches(&cfg, CacheOptions::default());
+        assert!(caches[0].is_some());
+        assert!(caches[2].is_none(), "KV-shared layer has no cache slot");
+
+        let ids: Vec<i32> = (0..5).collect();
+        let inputs = Array::from_slice(&ids, &[1, 5]);
+        let logits = model
+            .forward(ModelInput {
+                inputs: &inputs,
+                mask: None,
+                cache: &mut caches,
+            })
+            .unwrap();
+        eval([&logits]).unwrap();
+        assert_eq!(logits.shape(), &[1, 5, vocab]);
+
+        let next = Array::from_slice(&[7_i32], &[1, 1]);
+        let logits2 = model
+            .forward(ModelInput {
+                inputs: &next,
+                mask: None,
+                cache: &mut caches,
+            })
+            .unwrap();
+        eval([&logits2]).unwrap();
+        assert_eq!(logits2.shape(), &[1, 1, vocab]);
+    }
+
+    #[test]
+    fn kv_shared_layers_drop_own_kv() {
+        let cfg = synthetic_e2b();
+        // first_kv_shared = 4 - 2 = 2.
+        let owned = Attention::new(&cfg, 0).unwrap();
+        let shared = Attention::new(&cfg, 3).unwrap();
+        assert!(owned.has_kv && owned.k_proj.is_some() && owned.k_norm.is_some());
+        assert!(!shared.has_kv && shared.k_proj.is_none() && shared.v_norm.is_none());
     }
 }

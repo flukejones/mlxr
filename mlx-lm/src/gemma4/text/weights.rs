@@ -60,10 +60,38 @@ fn rewrite_outer_key(key: &str) -> String {
     key.to_owned()
 }
 
+/// `k_*`/`v_*` keys for KV-shared layers (`>= num_layers - num_shared`)
+/// must be dropped: those layers own no K/V projection (they reuse a prior
+/// layer's), so the model has no slot for them. Key is post-`rewrite_outer_key`
+/// (`model.layers.N.…`).
+fn is_shared_kv_layer_key(key: &str, num_layers: i32, num_shared: i32) -> bool {
+    if num_shared <= 0 {
+        return false;
+    }
+    let first_shared = num_layers - num_shared;
+    let Some(rest) = key.strip_prefix("model.layers.") else {
+        return false;
+    };
+    let Some(dot) = rest.find('.') else {
+        return false;
+    };
+    let Ok(layer_idx) = rest[..dot].parse::<i32>() else {
+        return false;
+    };
+    if layer_idx < first_shared {
+        return false;
+    }
+    let tail = &rest[dot + 1..];
+    tail.starts_with("self_attn.k_") || tail.starts_with("self_attn.v_")
+}
+
 /// Load every shard, drop/rewrite per-key, then map quantised
-/// `<prefix>.weight` → `<prefix>.inner.weight`.
+/// `<prefix>.weight` → `<prefix>.inner.weight`. `num_kv_shared` drops the
+/// K/V keys of KV-shared layers (E2B/E4B); 0 for dense/MoE.
 pub(crate) fn load_sanitized_weights(
     model_dir: impl AsRef<Path>,
+    num_layers: i32,
+    num_kv_shared: i32,
 ) -> Result<HashMap<String, Array>, Error> {
     let shards = list_shards(model_dir.as_ref())?;
     let mut raw: HashMap<String, Array> = HashMap::new();
@@ -73,7 +101,11 @@ pub(crate) fn load_sanitized_weights(
             if should_drop(&k) {
                 continue;
             }
-            raw.insert(rewrite_outer_key(&k), v);
+            let key = rewrite_outer_key(&k);
+            if is_shared_kv_layer_key(&key, num_layers, num_kv_shared) {
+                continue;
+            }
+            raw.insert(key, v);
         }
     }
     Ok(rewrite_quantised_keys(raw))
@@ -91,7 +123,11 @@ pub(crate) fn load_model(
         model = model.try_into_quantized(q.group_size, q.bits)?;
     }
 
-    let weights = load_sanitized_weights(model_dir)?;
+    let weights = load_sanitized_weights(
+        model_dir,
+        env.text_config.num_hidden_layers,
+        env.text_config.num_kv_shared_layers,
+    )?;
 
     let mut leftover: Vec<String> = Vec::new();
     {

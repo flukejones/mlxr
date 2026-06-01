@@ -152,17 +152,42 @@ fn lm_input(prompt: &Array) -> LMInput {
     }
 }
 
-/// Prefill timing: one `prepare` eval'd; logits discarded.
-fn time_prefill(ctx: &mut ModelContext, prompt: &Array) -> Duration {
-    ctx.model.reset();
-    let t_start = Instant::now();
-    let logits = match ctx.model.prepare(lm_input(prompt)).unwrap() {
+/// Prime the cache with `prompt`, chunking at `prefill_chunk_size` (e.g.
+/// gemma4 sliding-window models) exactly as production does, and return the
+/// last chunk's `prepare` logits. Calling `prepare` with a prompt longer
+/// than the sliding window would build a full-length mask against a
+/// window-truncated KV and panic — chunking is the production path.
+fn prime(ctx: &mut ModelContext, prompt: &Array) -> Array {
+    let prompt_len = prompt.shape()[1];
+    let logits_of = |res: mlx_lm::PrepareResult, ctx: &mut ModelContext| match res {
         mlx_lm::PrepareResult::Logits(l) => l,
         mlx_lm::PrepareResult::Primed => {
             let seed = Array::from_slice::<i32>(&[0], &[1]);
             ctx.model.step(&seed).unwrap().logits
         }
     };
+    if let Some(window) = ctx.model.prefill_chunk_size() {
+        if prompt_len > window {
+            let mut start = 0;
+            while prompt_len - start > window {
+                let chunk = prompt.index((.., start..start + window));
+                ctx.model.prefill_chunk(&chunk).unwrap();
+                start += window;
+            }
+            let tail = prompt.index((.., start..prompt_len));
+            let res = ctx.model.prepare(lm_input(&tail)).unwrap();
+            return logits_of(res, ctx);
+        }
+    }
+    let res = ctx.model.prepare(lm_input(prompt)).unwrap();
+    logits_of(res, ctx)
+}
+
+/// Prefill timing: chunked prime, eval'd; logits discarded.
+fn time_prefill(ctx: &mut ModelContext, prompt: &Array) -> Duration {
+    ctx.model.reset();
+    let t_start = Instant::now();
+    let logits = prime(ctx, prompt);
     eval([&logits]).unwrap();
     Instant::now() - t_start
 }
@@ -174,13 +199,7 @@ fn time_prefill(ctx: &mut ModelContext, prompt: &Array) -> Duration {
 fn time_decode(ctx: &mut ModelContext, prompt: &Array, steps: i32) -> Duration {
     ctx.model.reset();
     let mut sampler = SamplerState::new(Sampler::Temperature(DECODE_TEMP));
-    let initial = match ctx.model.prepare(lm_input(prompt)).unwrap() {
-        mlx_lm::PrepareResult::Logits(l) => l,
-        mlx_lm::PrepareResult::Primed => {
-            let seed = Array::from_slice::<i32>(&[0], &[1]);
-            ctx.model.step(&seed).unwrap().logits
-        }
-    };
+    let initial = prime(ctx, prompt);
     let mut pending = sampler.sample(&initial).unwrap();
     // Fence prefill + first token before timing — otherwise the prompt
     // forward (large for long prompts) folds into the first decode step.
@@ -457,6 +476,20 @@ fn bench_decode(c: &mut Criterion) {
             "gemma4",
             "26b_a4b_it_q4",
             "mlx-community/gemma-4-26b-a4b-it-4bit",
+        );
+
+        // gemma4 E2B/E4B — per-layer-input embeddings + KV-sharing.
+        maybe_bench(
+            c,
+            "gemma4",
+            "e2b_it_q8",
+            "mlx-community/gemma-4-e2b-it-8bit",
+        );
+        maybe_bench(
+            c,
+            "gemma4",
+            "e4b_it_q8",
+            "mlx-community/gemma-4-e4b-it-8bit",
         );
     }
 }

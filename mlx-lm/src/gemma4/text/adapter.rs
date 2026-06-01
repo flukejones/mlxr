@@ -21,7 +21,7 @@ use crate::gemma4::text::text::Model;
 use crate::gemma4::text::weights::load_model;
 use crate::language_model::{LanguageModel, TextOnlyProcessor};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
-use crate::loader::load_tokenizer;
+use crate::loader::{load_tokenizer, resolve_bos_id};
 use crate::nn::ModelInput;
 
 pub(crate) struct Gemma4Adapter {
@@ -109,8 +109,9 @@ pub(crate) fn load_context(
 ) -> Result<LoadedContext, Error> {
     let model = Gemma4Adapter::load(cfg, env, dir)?;
     let tokenizer = load_tokenizer(dir)?;
+    let bos_id = resolve_bos_id(dir, &tokenizer);
     let chat_template = ChatTemplate::from_dir(dir)?;
     let eos_ids = EosSpec::to_vec(env.eos_token_id.as_ref());
-    let processor = TextOnlyProcessor::new("gemma4", tokenizer, chat_template);
+    let processor = TextOnlyProcessor::new("gemma4", tokenizer, chat_template, bos_id);
     Ok((Box::new(model), Box::new(processor), eos_ids))
 }

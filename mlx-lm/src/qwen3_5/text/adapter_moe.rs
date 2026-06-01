@@ -18,6 +18,7 @@ use crate::error::Error;
 use crate::family::LoadedContext;
 use crate::language_model::{LanguageModel, TextOnlyProcessor};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
+use crate::loader::resolve_bos_id;
 use crate::qwen3_5::text::cache::{make_caches, make_mtp_caches, LayerCache};
 use crate::qwen3_5::text::config::ModelConfig;
 use crate::qwen3_5::text::layer::Qwen35Model;
@@ -583,6 +584,7 @@ pub(crate) fn load_context_moe(
 ) -> Result<LoadedContext, Error> {
     let model = Qwen35MoeAdapter::load(cfg, env, dir)?;
     let (tokenizer, chat_template, eos_ids) = load_common(env, dir)?;
-    let processor = TextOnlyProcessor::new("qwen3_5_moe", tokenizer, chat_template);
+    let bos_id = resolve_bos_id(dir, &tokenizer);
+    let processor = TextOnlyProcessor::new("qwen3_5_moe", tokenizer, chat_template, bos_id);
     Ok((Box::new(model), Box::new(processor), eos_ids))
 }

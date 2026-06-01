@@ -49,6 +49,34 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
+/// BOS id to prepend to raw prompts, or `None` when the model declares no
+/// BOS or opts out (`add_bos_token: false`).
+///
+/// The fast tokenizer's `post_processor` frequently omits BOS even with
+/// `add_special_tokens` (e.g. mlx-community Gemma drops it), so we resolve
+/// the policy from `tokenizer_config.json` and prepend in the processor.
+/// `add_bos_token` is honoured when present; when absent we follow the
+/// HuggingFace default of prepending whenever a `bos_token` exists
+/// (Gemma, Llama 3 — both BOS-sensitive). Qwen sets `bos_token: null`, so
+/// this returns `None` there.
+pub fn resolve_bos_id(model_dir: impl AsRef<Path>, tokenizer: &Tokenizer) -> Option<u32> {
+    let path = model_dir.as_ref().join("tokenizer_config.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if cfg.get("add_bos_token").and_then(|v| v.as_bool()) == Some(false) {
+        return None;
+    }
+    let bos = cfg.get("bos_token").and_then(bos_token_str)?;
+    tokenizer.token_to_id(bos)
+}
+
+/// `bos_token` is either a plain string or an `AddedToken` object with a
+/// `content` field.
+fn bos_token_str(v: &serde_json::Value) -> Option<&str> {
+    v.as_str()
+        .or_else(|| v.get("content").and_then(|c| c.as_str()))
+}
+
 /// Safetensors shard paths: single `model.safetensors`, else the unique
 /// shards in `model.safetensors.index.json`, sorted.
 pub fn list_shards(model_dir: &Path) -> Result<Vec<PathBuf>, Error> {

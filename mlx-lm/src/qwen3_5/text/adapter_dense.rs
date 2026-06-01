@@ -17,6 +17,7 @@ use crate::error::Error;
 use crate::family::LoadedContext;
 use crate::language_model::{LanguageModel, TextOnlyProcessor};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
+use crate::loader::resolve_bos_id;
 use crate::qwen3_5::text::cache::{make_caches, LayerCache};
 use crate::qwen3_5::text::config::ModelConfig;
 use crate::qwen3_5::text::layer::Qwen35Model;
@@ -162,11 +163,12 @@ pub(crate) fn load_context_dense(
     dir: &Path,
 ) -> Result<LoadedContext, Error> {
     let (tokenizer, chat_template, eos_ids) = load_common(env, dir)?;
+    let bos_id = resolve_bos_id(dir, &tokenizer);
     let (model, leftover) = load_language_model(cfg, env, dir)?;
     if !leftover.is_empty() {
         return Err(leftover_keys_error("dense", &leftover));
     }
     let dense = Qwen35DenseAdapter::new(model, env.clone())?;
-    let processor = TextOnlyProcessor::new("qwen3_5", tokenizer, chat_template);
+    let processor = TextOnlyProcessor::new("qwen3_5", tokenizer, chat_template, bos_id);
     Ok((Box::new(dense), Box::new(processor), eos_ids))
 }

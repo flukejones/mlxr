@@ -95,6 +95,12 @@ pub struct TextOnlyProcessor {
     family: &'static str,
     tokenizer: tokenizers::Tokenizer,
     chat_template: ChatTemplate,
+    /// BOS id to prepend when the encoded prompt lacks it. `Some` when the
+    /// checkpoint declares a `bos_token` and does not set
+    /// `add_bos_token: false` — the fast tokenizer's `post_processor`
+    /// often omits BOS even with `add_special_tokens`, and BOS-sensitive
+    /// families (Gemma, Llama 3) emit garbage without it.
+    bos_id: Option<u32>,
 }
 
 impl TextOnlyProcessor {
@@ -102,11 +108,13 @@ impl TextOnlyProcessor {
         family: &'static str,
         tokenizer: tokenizers::Tokenizer,
         chat_template: ChatTemplate,
+        bos_id: Option<u32>,
     ) -> Self {
         Self {
             family,
             tokenizer,
             chat_template,
+            bos_id,
         }
     }
 }
@@ -127,7 +135,16 @@ impl UserInputProcessor for TextOnlyProcessor {
             .tokenizer
             .encode(rendered.as_str(), false)
             .map_err(|e| Error::Other(format!("tokenizer encode: {e}").into()))?;
-        let ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+        let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+        // The fast tokenizer's post_processor omits BOS for some
+        // conversions (e.g. mlx-community Gemma). Prepend it ourselves
+        // unless the rendered prompt already produced it (chat templates
+        // that emit `{{ bos_token }}`).
+        if let Some(bos) = self.bos_id {
+            if ids.first() != Some(&(bos as i32)) {
+                ids.insert(0, bos as i32);
+            }
+        }
         let len = ids.len() as i32;
         let tokens = mlx_rs::Array::from_slice(&ids, &[1, len]);
         Ok(LMInput {
@@ -160,7 +177,17 @@ mod tests {
         let template = ChatTemplate::from_source(
             "{% for m in messages %}{{ m.role }}={{ m.content }}|{% endfor %}",
         );
-        TextOnlyProcessor::new("test", tokenizer, template)
+        TextOnlyProcessor::new("test", tokenizer, template, None)
+    }
+
+    fn bos_processor(bos: u32) -> TextOnlyProcessor {
+        let mut p = dummy_processor();
+        p.bos_id = Some(bos);
+        p
+    }
+
+    fn token_ids(lm: &LMInput) -> Vec<i32> {
+        lm.text.tokens.as_slice::<i32>().to_vec()
     }
 
     #[test]
@@ -169,6 +196,30 @@ mod tests {
         let lm = p.prepare(UserInput::text("hello world")).unwrap();
         assert_eq!(lm.text.tokens.shape()[0], 1);
         assert!(lm.text.tokens.shape()[1] >= 1);
+    }
+
+    // The dummy WordLevel tokenizer has no whitespace pre-tokenizer, so
+    // "hello world" is one out-of-vocab token → `[<unk>=2]`.
+    #[test]
+    fn no_bos_when_unset() {
+        let mut p = dummy_processor();
+        let lm = p.prepare(UserInput::text("hello world")).unwrap();
+        assert_eq!(token_ids(&lm), vec![2]);
+    }
+
+    #[test]
+    fn bos_prepended_when_set() {
+        let mut p = bos_processor(5);
+        let lm = p.prepare(UserInput::text("hello world")).unwrap();
+        assert_eq!(token_ids(&lm), vec![5, 2]);
+    }
+
+    #[test]
+    fn bos_not_doubled_when_already_present() {
+        // BOS id equals the prompt's first encoded token (`<unk>=2`).
+        let mut p = bos_processor(2);
+        let lm = p.prepare(UserInput::text("hello world")).unwrap();
+        assert_eq!(token_ids(&lm), vec![2]);
     }
 
     #[test]

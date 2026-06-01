@@ -14,6 +14,7 @@ use crate::language_model::{LanguageModel, TextOnlyProcessor};
 use crate::llama::text::config::ModelArgs;
 use crate::llama::text::model::{load_llama_model, load_llama_tokenizer, Model};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
+use crate::loader::resolve_bos_id;
 use crate::nn::ModelInput;
 
 struct LlamaAdapter {
@@ -64,8 +65,9 @@ pub(crate) fn load_context(
 
     let model = load_llama_model(dir)?;
     let tokenizer = load_llama_tokenizer(dir)?;
+    let bos_id = resolve_bos_id(dir, &tokenizer);
     let chat_template = ChatTemplate::from_dir(dir)?;
-    let processor = TextOnlyProcessor::new("llama", tokenizer, chat_template);
+    let processor = TextOnlyProcessor::new("llama", tokenizer, chat_template, bos_id);
 
     let adapter = LlamaAdapter {
         model,

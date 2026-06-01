@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::family::{EosSpec, LoadedContext};
 use crate::language_model::{LanguageModel, TextOnlyProcessor};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
+use crate::loader::resolve_bos_id;
 use crate::nn::ModelInput;
 use crate::qwen3::text::config::ModelArgs;
 use crate::qwen3::text::model::{load_qwen3_model, load_qwen3_tokenizer, Model};
@@ -64,8 +65,9 @@ pub(crate) fn load_context(
 
     let model = load_qwen3_model(dir)?;
     let tokenizer = load_qwen3_tokenizer(dir)?;
+    let bos_id = resolve_bos_id(dir, &tokenizer);
     let chat_template = ChatTemplate::from_dir(dir)?;
-    let processor = TextOnlyProcessor::new("qwen3", tokenizer, chat_template);
+    let processor = TextOnlyProcessor::new("qwen3", tokenizer, chat_template, bos_id);
 
     let adapter = Qwen3Adapter {
         model,

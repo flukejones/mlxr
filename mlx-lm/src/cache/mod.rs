@@ -4,6 +4,8 @@
 //! - [`kvcache`] — [`KVCache`], the default pre-allocated step-grown cache
 //! - [`quantized_kvcache`] — [`QuantizedKVCache`], affine-quant K/V with
 //!   independent `k_bits`/`v_bits`
+//! - [`rotating_kvcache`] — [`RotatingKVCache`], sliding-window ring buffer
+//!   (Gemma 3/4 sliding layers)
 //! - [`full_attn`] — [`FullAttnCache`], the shared full-attention slot
 //! - [`options`] — [`CacheOptions`] / [`CacheKind`] + prefill-chunk helpers
 
@@ -11,6 +13,7 @@ pub mod full_attn;
 pub mod kvcache;
 pub mod options;
 pub mod quantized_kvcache;
+pub mod rotating_kvcache;
 pub mod trait_def;
 
 pub use full_attn::FullAttnCache;
@@ -19,4 +22,5 @@ pub use options::{
     CacheKind, CacheOptions, DEFAULT_KV_GROUP_SIZE, DEFAULT_PREFILL_CHUNK, MIN_K_BITS,
 };
 pub use quantized_kvcache::QuantizedKVCache;
+pub use rotating_kvcache::RotatingKVCache;
 pub use trait_def::KeyValueCache;

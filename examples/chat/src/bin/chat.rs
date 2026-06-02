@@ -16,7 +16,9 @@ use mlx_lm::cache::{CacheKind, CacheOptions, DEFAULT_KV_GROUP_SIZE};
 use mlx_lm::chat_template::ChatMessage;
 #[cfg(feature = "audio")]
 use mlx_lm::Audio;
-use mlx_lm::{generate, load, GenerateParams, Image, ModelContext, Sampler, UserInput};
+use mlx_lm::{
+    generate, load_with_drafter, GenerateParams, Image, ModelContext, Sampler, UserInput,
+};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -94,6 +96,19 @@ struct Args {
     /// instruction sent alongside --image/--audio (default empty)
     #[argh(option, default = "String::new()")]
     prompt: String,
+
+    /// path to a gemma4 MTP assistant (drafter) checkpoint; enables
+    /// speculative decode (gemma4 text only)
+    #[argh(option, long = "draft-model")]
+    draft_model: Option<PathBuf>,
+
+    /// drafter depth γ (tokens drafted per step); default 1
+    #[argh(option, long = "mtp-depth")]
+    mtp_depth: Option<u32>,
+
+    /// load the drafter but run plain decode (A/B baseline; same prompt path)
+    #[argh(switch, long = "no-mtp")]
+    no_mtp: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -194,7 +209,14 @@ fn main() -> Result<()> {
     let args: Args = argh::from_env();
 
     eprintln!("[loading {}]", args.model.display());
-    let mut ctx = load(&args.model).context("load model")?;
+    if let Some(d) = &args.draft_model {
+        eprintln!("[drafter {}]", d.display());
+    }
+    let mut ctx =
+        load_with_drafter(&args.model, args.draft_model.as_deref()).context("load model")?;
+    if let Some(n) = args.mtp_depth {
+        ctx.model.set_mtp_depth(n);
+    }
     // 0 → disable chunking. Otherwise the user-provided value (or
     // `CacheOptions::default()`'s 2048 fallback) is used.
     let max_prefill_chunk = match args.prefill_chunk_size {
@@ -332,6 +354,7 @@ fn build_params(args: &Args) -> GenerateParams {
     GenerateParams {
         max_new_tokens: args.max_tokens,
         sampling,
+        disable_mtp: args.no_mtp,
         ..GenerateParams::default()
     }
 }

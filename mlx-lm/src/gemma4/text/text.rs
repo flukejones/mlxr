@@ -1004,6 +1004,26 @@ impl Model {
     }
 }
 
+impl Model {
+    /// Forward returning `(post-norm hidden, logits)` — the MTP drafter needs
+    /// the last-position hidden for its concat input.
+    pub fn forward_hidden_and_logits<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut [Option<C>],
+    ) -> Result<(Array, Array), Error> {
+        let h = self.model.embed_scaled(inputs)?;
+        let hidden = self.model.forward_from_hidden(h, inputs, cache)?;
+        let logits = self.apply_head(&hidden)?;
+        Ok((hidden, logits))
+    }
+
+    /// `embed_scale`d token embedding — the MTP drafter's concat input half.
+    pub fn embed_scaled_token(&mut self, inputs: &Array) -> Result<Array, Error> {
+        self.model.embed_scaled(inputs)
+    }
+}
+
 impl<C> Module<ModelInput<'_, C>> for Model
 where
     C: KeyValueCache,

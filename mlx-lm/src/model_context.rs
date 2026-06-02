@@ -87,9 +87,19 @@ impl ModelContext {
 
 /// Parse `<dir>/config.json` once and dispatch to the family loader.
 pub fn load(dir: impl AsRef<Path>) -> Result<ModelContext, Error> {
+    load_with_drafter(dir, None)
+}
+
+/// Like [`load`] but with an optional MTP drafter (assistant) checkpoint dir.
+/// Only the gemma4 family consumes it; passing a drafter for any other family
+/// is an error.
+pub fn load_with_drafter(
+    dir: impl AsRef<Path>,
+    draft_dir: Option<&Path>,
+) -> Result<ModelContext, Error> {
     let dir = dir.as_ref();
     let cfg = ModelConfig::from_dir(dir)?;
-    let (model, processor, eos_ids) = dispatch_load(&cfg, dir)?;
+    let (model, processor, eos_ids) = dispatch_load(&cfg, dir, draft_dir)?;
     Ok(ModelContext {
         model,
         processor,
@@ -99,14 +109,23 @@ pub fn load(dir: impl AsRef<Path>) -> Result<ModelContext, Error> {
 
 /// Route the typed [`Family`] to its family `load_context`. No string
 /// compare reaches runtime; serde picked the variant at parse.
-fn dispatch_load(cfg: &ModelConfig, dir: &Path) -> Result<LoadedContext, Error> {
+fn dispatch_load(
+    cfg: &ModelConfig,
+    dir: &Path,
+    draft_dir: Option<&Path>,
+) -> Result<LoadedContext, Error> {
+    if draft_dir.is_some() && !matches!(cfg.family, Family::Gemma4(_)) {
+        return Err(Error::config(
+            "an MTP drafter is only supported for the gemma4 family",
+        ));
+    }
     match &cfg.family {
         Family::Llama(_) => llama::load_context(cfg, dir),
         Family::Qwen3(_) => qwen3::load_context(cfg, dir),
         Family::Qwen35(_) | Family::Qwen35Moe(_) | Family::Qwen35Vl(_) => {
             qwen3_5::load_context(cfg, dir)
         }
-        Family::Gemma4(_) => gemma4::load_context(cfg, dir),
+        Family::Gemma4(_) => gemma4::load_context(cfg, dir, draft_dir),
     }
 }
 

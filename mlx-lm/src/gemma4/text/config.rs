@@ -118,7 +118,11 @@ pub struct TextConfig {
     /// Full-attention layers may share one projection for K and V.
     #[serde(default)]
     pub attention_k_eq_v: bool,
-    #[serde(default = "default_final_logit_softcapping")]
+    /// Explicit `null` (the assistant drafter sets it so) → no softcap.
+    #[serde(
+        default = "default_final_logit_softcapping",
+        deserialize_with = "deserialize_softcap"
+    )]
     pub final_logit_softcapping: f32,
     #[serde(default = "default_use_double_wide_mlp")]
     pub use_double_wide_mlp: bool,
@@ -183,6 +187,14 @@ const fn default_sliding_window_pattern() -> i32 {
 }
 const fn default_final_logit_softcapping() -> f32 {
     30.0
+}
+
+/// Number, or explicit `null` → `0.0`. Absent uses the serde default.
+fn deserialize_softcap<'de, D>(d: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f32>::deserialize(d)?.unwrap_or(0.0))
 }
 const fn default_use_double_wide_mlp() -> bool {
     true

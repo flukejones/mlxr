@@ -26,8 +26,8 @@ pub use lm_input::ProcessedAudio;
 pub use lm_input::ProcessedImage;
 pub use lm_input::{LMInput, PrepareResult, Text};
 pub use model_context::{
-    decode_step, generate, load, FinishReason, GenerateParams, GenerateResult, ModelContext,
-    TokenCallback,
+    decode_step, generate, load, load_with_drafter, FinishReason, GenerateParams, GenerateResult,
+    ModelContext, TokenCallback,
 };
 pub use sampler::{Sampler, SamplerState};
 #[cfg(feature = "audio")]

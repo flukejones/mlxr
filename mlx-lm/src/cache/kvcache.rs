@@ -140,4 +140,64 @@ impl KeyValueCache for KVCache {
             buf_v.index((Ellipsis, 0..end, ..)),
         ))
     }
+
+    fn current_kv(&self) -> Result<Option<(Array, Array)>, Exception> {
+        if self.offset == 0 {
+            return Ok(None);
+        }
+        let (buf_k, buf_v) = match (self.keys.as_ref(), self.values.as_ref()) {
+            (Some(k), Some(v)) => (k, v),
+            _ => return Ok(None),
+        };
+        let end = self.offset;
+        Ok(Some((
+            buf_k.index((Ellipsis, 0..end, ..)),
+            buf_v.index((Ellipsis, 0..end, ..)),
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test code")]
+    use super::*;
+    use mlx_rs::ops::all_close;
+
+    fn tok(v: f32) -> Array {
+        // [B=1, H=1, S=1, D=2]
+        Array::from_slice(&[v, v], &[1, 1, 1, 2])
+    }
+
+    #[test]
+    fn current_kv_none_when_empty() {
+        let c = KVCache::new();
+        assert!(c.current_kv().unwrap().is_none());
+    }
+
+    #[test]
+    fn current_kv_matches_fetch_without_advancing() {
+        let mut c = KVCache::new();
+        c.update_and_fetch(tok(1.0), tok(-1.0)).unwrap();
+        c.update_and_fetch(tok(2.0), tok(-2.0)).unwrap();
+        let off_before = c.offset();
+
+        let (k, v) = c.current_kv().unwrap().expect("non-empty");
+        // Offset unchanged — current_kv is read-only.
+        assert_eq!(c.offset(), off_before);
+        assert_eq!(k.shape(), &[1, 1, 2, 2]);
+
+        // Same tensors a zero-length fetch would return.
+        let (k_ref, v_ref) = c
+            .update_and_fetch(
+                Array::zeros::<f32>(&[1, 1, 0, 2]).unwrap(),
+                Array::zeros::<f32>(&[1, 1, 0, 2]).unwrap(),
+            )
+            .unwrap();
+        assert!(all_close(&k, &k_ref, None, None, None)
+            .unwrap()
+            .item::<bool>());
+        assert!(all_close(&v, &v_ref, None, None, None)
+            .unwrap()
+            .item::<bool>());
+    }
 }

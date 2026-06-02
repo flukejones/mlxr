@@ -92,6 +92,13 @@ impl KeyValueCache for FullAttnCache {
         }
     }
 
+    fn current_kv(&self) -> Result<Option<(Array, Array)>, Exception> {
+        match self {
+            Self::Standard(c) => c.current_kv(),
+            Self::Quantized(c) => c.current_kv(),
+        }
+    }
+
     fn attention(
         &mut self,
         queries: &Array,

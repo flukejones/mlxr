@@ -60,6 +60,15 @@ pub trait KeyValueCache {
     fn update_and_fetch(&mut self, keys: Array, values: Array)
         -> Result<(Array, Array), Exception>;
 
+    /// Dense `(keys, values)` over the currently-cached history WITHOUT
+    /// appending or advancing the offset — the same tensors a zero-length
+    /// [`Self::update_and_fetch`] would return. `None` when the cache is
+    /// empty. Quantised caches dequantise to dense. Used by a cross-model
+    /// draft head that borrows this cache's K/V read-only.
+    fn current_kv(&self) -> Result<Option<(Array, Array)>, Exception> {
+        Ok(None)
+    }
+
     /// `softmax(scaled_q @ K.T) @ V` over the full cached history.
     fn attention(
         &mut self,
@@ -114,6 +123,10 @@ where
         values: Array,
     ) -> Result<(Array, Array), Exception> {
         T::update_and_fetch(self, keys, values)
+    }
+
+    fn current_kv(&self) -> Result<Option<(Array, Array)>, Exception> {
+        T::current_kv(self)
     }
 
     fn attention(

@@ -180,6 +180,13 @@ impl KeyValueCache for RotatingKVCache {
         Some(self.max_size)
     }
 
+    fn current_kv(&self) -> Result<Option<(Array, Array)>, Exception> {
+        if self.offset == 0 || self.keys.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.snapshot_window()?))
+    }
+
     fn update_and_fetch(
         &mut self,
         keys: Array,

@@ -6,10 +6,8 @@
 
 use std::path::Path;
 
-use log::warn;
-use mlx_rs::ops::indexing::{argmax_axis, take_along_axis, IndexOp};
-use mlx_rs::ops::{concatenate_axis, exp, maximum, r#where, stack_axis, sum_axis};
-use mlx_rs::random::{categorical, uniform};
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::ops::{concatenate_axis, stack_axis};
 use mlx_rs::Array;
 
 use crate::cache::CacheOptions;
@@ -24,8 +22,10 @@ use crate::qwen3_5::text::config::ModelConfig;
 use crate::qwen3_5::text::layer::Qwen35Model;
 use crate::qwen3_5::text::load_common;
 use crate::qwen3_5::text::moe::{load_qwen3_5_moe_model, Qwen35MoeBlock};
-use crate::qwen3_5::text::sampling::top_p_keep_mask;
-use crate::sampler::{Sampler, SamplerState};
+use crate::sampler::SamplerState;
+use crate::speculative::{
+    accept_mask, draft_confidence, draft_gate_for, resample_on_reject, sample_draft, CacheSnapshot,
+};
 
 /// Upper bound on MTP draft depth. The walk-back algorithm is
 /// depth-generic; this cap reflects the depth past which adding
@@ -226,24 +226,32 @@ fn mtp_step(
     // are `mlx::core::array` shared_ptr handles). The guard restores
     // both caches if dropped without `.commit()`, including the `?`
     // early-exit paths in the verify forward + accept_draft below.
-    let mut cache_guard = CacheSnapshot::new(&adapter.cache, &adapter.mtp_cache);
+    let mut main_guard = CacheSnapshot::new(&adapter.cache);
+    let mut mtp_guard = CacheSnapshot::new(&adapter.mtp_cache);
 
     // Build the chained draft: drafts[i] predicts the token at slot
     // `last_token + i + 1`. Each MTP forward advances mtp_cache by 1
     // and produces both the draft's logits and the post-norm hidden
     // that feeds the NEXT chained MTP call as its `prev_hidden`.
+    // Confidence gate: stop drafting at the first token the MTP head is unsure
+    // about. On a fast target, verifying a low-confidence draft costs more than
+    // a plain decode, so an empty draft falls back to an ordinary verified step.
     let mut draft_ids: Vec<Array> = Vec::with_capacity(depth);
     let mut draft_logits: Vec<Array> = Vec::with_capacity(depth);
     let mut prev_h = prev_hidden;
     let mut token_in = last_token_2d.clone();
-    for _ in 0..depth {
+    for d in 0..depth {
         let (logits_i, mtp_post_norm_i) = run_mtp(adapter, &prev_h, &token_in)?;
         let id_i = sample_draft(sampler, &logits_i)?;
+        if draft_confidence(&logits_i, &id_i)? < draft_gate_for(d) {
+            break;
+        }
         token_in = id_i.reshape(&[1, 1])?;
         prev_h = mtp_post_norm_i;
         draft_ids.push(id_i);
         draft_logits.push(logits_i);
     }
+    let depth = draft_ids.len();
 
     // Verify forward on [last_token, draft_0, .., draft_{depth-1}].
     // Main cache advances by depth+1.
@@ -265,6 +273,18 @@ fn mtp_step(
     // Now sync `last_token` to host — verify forward has been submitted,
     // so this read overlaps with its dispatch instead of blocking it.
     let last_u32 = host_id_to_u32(last_token.item::<i32>(), adapter.vocab_size)?;
+
+    // Gate truncated every draft: the verify forward was a plain decode of
+    // `last_token`. The draft loop still ran one `run_mtp` before the gate
+    // broke, advancing `mtp_cache` by the one committed token, so both caches
+    // stay in lockstep — commit both and sample next from verify position 0.
+    if depth == 0 {
+        main_guard.commit();
+        mtp_guard.commit();
+        adapter.prev_hidden = Some(verify_hidden.index((.., -1..)));
+        let next_pending = sampler.sample(&verify_logits.index((.., 0, ..)))?;
+        return Ok((vec![last_u32], next_pending));
+    }
 
     // Materialise host ids for every draft in one sync, instead of
     // re-syncing each `draft_ids[i]` individually inside the commit
@@ -312,7 +332,8 @@ fn mtp_step(
 
     if k == depth {
         // All-accept: commit last_token + every draft.
-        cache_guard.commit();
+        main_guard.commit();
+        mtp_guard.commit();
         adapter.prev_hidden = Some(verify_hidden.index((.., -1..)));
         let next_logits = verify_logits.index((.., depth as i32, ..));
         let next_pending = sampler.sample(&next_logits)?;
@@ -328,7 +349,8 @@ fn mtp_step(
     // exactly the accepted prefix (k+1 tokens) on the main side, plus
     // matching MTP-cache priming so the next call's RoPE positions
     // line up.
-    cache_guard.rollback_into(&mut adapter.cache, &mut adapter.mtp_cache);
+    main_guard.rollback_into(&mut adapter.cache);
+    mtp_guard.rollback_into(&mut adapter.mtp_cache);
 
     let corrected = {
         let verify_k = verify_logits.index((.., k as i32, ..));
@@ -362,109 +384,6 @@ fn mtp_step(
     committed.push(last_u32);
     committed.extend_from_slice(&draft_ids_host[..k]);
     Ok((committed, corrected))
-}
-
-/// Pick the draft token. Greedy at `temperature == 0` (`argmax`);
-/// categorical on the masked log-probs otherwise. The `[1]`-shape
-/// output is what the rest of the speculative step expects.
-fn sample_draft(sampler: &mut SamplerState, draft_logits: &Array) -> Result<Array, Error> {
-    if matches!(sampler.sampler(), Sampler::Greedy) {
-        return Ok(argmax_axis(draft_logits, -1, None)?.reshape(&[1])?);
-    }
-    let top_p_mask = match sampler.sampler().top_p() {
-        Some(p) => Some(top_p_keep_mask(draft_logits, p)?),
-        None => None,
-    };
-    let lp = sampler.masked_log_probs(draft_logits, top_p_mask.as_ref())?;
-    Ok(categorical(&lp, None, None, None)?.reshape(&[1])?)
-}
-
-/// Per-level accept decisions for the whole draft batch in ONE device
-/// pass + ONE host read, so verify-forward compute isn't serialized by a
-/// `.item()` between levels. `draft_ids_stacked` is `[depth]`;
-/// `draft_logits`/`verify_levels` are each `[depth, vocab]` (row `i` =
-/// level `i`).
-///
-/// Per-level acceptance is identical to the old scalar loop: at
-/// `temperature == 0` argmax equality; above 0 the Leviathan test over a
-/// shared union top-p mask, accept iff
-/// `log p_verify(draft) - log p_draft(draft) >= log u`. The single
-/// `uniform([depth])` draw has the same per-level acceptance probability
-/// as the old depth-many scalar draws, but is not bit-identical for a
-/// fixed seed.
-fn accept_mask(
-    sampler: &mut SamplerState,
-    draft_ids_stacked: &Array,
-    draft_logits: &Array,
-    verify_levels: &Array,
-) -> Result<Vec<bool>, Error> {
-    let accepts = if matches!(sampler.sampler(), Sampler::Greedy) {
-        let verify_ids = argmax_axis(verify_levels, -1, None)?;
-        verify_ids.eq(draft_ids_stacked)?
-    } else {
-        let keep_mask = match sampler.sampler().top_p() {
-            Some(p) => {
-                let draft_mask = top_p_keep_mask(draft_logits, p)?;
-                let verify_mask = top_p_keep_mask(verify_levels, p)?;
-                Some(draft_mask.logical_or(&verify_mask)?)
-            }
-            None => None,
-        };
-        let draft_lp = sampler.masked_log_probs(draft_logits, keep_mask.as_ref())?;
-        let verify_lp = sampler.masked_log_probs(verify_levels, keep_mask.as_ref())?;
-        let ids_2d = draft_ids_stacked.reshape(&[-1, 1])?;
-        let lp_v = take_along_axis(&verify_lp, &ids_2d, -1)?.reshape(&[-1])?;
-        let lp_d = take_along_axis(&draft_lp, &ids_2d, -1)?.reshape(&[-1])?;
-        let log_ratio = lp_v.subtract(&lp_d)?;
-        let depth = *log_ratio.shape().first().expect("log_ratio is [depth]");
-        let u = uniform::<_, f32>(0.0_f32, 1.0_f32, &[depth], None)?;
-        let log_u = u.log()?.as_dtype(log_ratio.dtype())?;
-        log_ratio.ge(&log_u)?
-    };
-    Ok(accepts.as_slice::<bool>().to_vec())
-}
-
-/// Pick the corrected token at the rejected position. At
-/// `temperature == 0` this is `argmax(verify_logits_i)`. Above 0 it
-/// is a categorical draw from the Leviathan residual
-/// `max(0, exp(verify_lp) - exp(draft_lp))`, falling back to the
-/// verify distribution when the residual sums to zero (degenerate
-/// case where the union top-p mask collapsed the support).
-fn resample_on_reject(
-    sampler: &mut SamplerState,
-    draft_logits: &Array,
-    verify_logits_i: &Array,
-) -> Result<Array, Error> {
-    if matches!(sampler.sampler(), Sampler::Greedy) {
-        return Ok(argmax_axis(verify_logits_i, -1, None)?.reshape(&[1])?);
-    }
-    let keep_mask = match sampler.sampler().top_p() {
-        Some(p) => {
-            let draft_mask = top_p_keep_mask(draft_logits, p)?;
-            let verify_mask = top_p_keep_mask(verify_logits_i, p)?;
-            Some(draft_mask.logical_or(&verify_mask)?)
-        }
-        None => None,
-    };
-    let draft_lp = sampler.masked_log_probs(draft_logits, keep_mask.as_ref())?;
-    let verify_lp = sampler.masked_log_probs(verify_logits_i, keep_mask.as_ref())?;
-    let p_v = exp(&verify_lp)?;
-    let p_d = exp(&draft_lp)?;
-    let zero = Array::from_f32(0.0).as_dtype(p_v.dtype())?;
-    let residual = maximum(&p_v.subtract(&p_d)?, &zero)?;
-    let z = sum_axis(&residual, -1, true)?;
-    // Host sync on z: residual either has mass (sample from it) or
-    // sums to zero (top-p mask collapsed the support — fall back to
-    // verify). The branch is cheap and only fires on reject.
-    let z_host = z.reshape(&[])?.item::<f32>();
-    if z_host > 0.0 {
-        let mask = residual.gt(&zero)?;
-        let safe = r#where(&mask, &residual, &zero)?;
-        let log_r = safe.log()?;
-        Ok(categorical(&log_r, None, None, None)?.reshape(&[1])?)
-    } else {
-        Ok(categorical(&verify_lp, None, None, None)?.reshape(&[1])?)
-    }
 }
 
 /// Run one MTP-head forward. Returns `(logits, mtp_post_norm)` — both
@@ -527,54 +446,6 @@ fn host_id_to_u32(id: i32, vocab: i32) -> Result<u32, Error> {
         )));
     }
     Ok(id as u32)
-}
-
-/// Pre-MTP snapshot of `(main_cache, mtp_cache)`. Holding it forces a
-/// caller to choose between [`Self::commit`] (keep the over-committed
-/// state — full accept path) and [`Self::rollback_into`] (restore
-/// before re-committing the accepted prefix — partial reject path).
-/// Dropping it without either is a logic bug; the destructor logs.
-struct CacheSnapshot {
-    main: Option<Vec<LayerCache>>,
-    mtp: Option<Vec<LayerCache>>,
-}
-
-impl CacheSnapshot {
-    fn new(main: &[LayerCache], mtp: &[LayerCache]) -> Self {
-        Self {
-            main: Some(main.to_vec()),
-            mtp: Some(mtp.to_vec()),
-        }
-    }
-
-    /// Discard the snapshot — the post-MTP cache state is what we
-    /// want.
-    fn commit(&mut self) {
-        self.main = None;
-        self.mtp = None;
-    }
-
-    /// Restore both caches from the snapshot. Consumes the snapshot
-    /// fields so [`Drop`] below doesn't double-warn.
-    fn rollback_into(&mut self, main: &mut Vec<LayerCache>, mtp: &mut Vec<LayerCache>) {
-        if let Some(s) = self.main.take() {
-            *main = s;
-        }
-        if let Some(s) = self.mtp.take() {
-            *mtp = s;
-        }
-    }
-}
-
-impl Drop for CacheSnapshot {
-    fn drop(&mut self) {
-        if self.main.is_some() || self.mtp.is_some() {
-            warn!(
-                "CacheSnapshot dropped without commit() or rollback_into(); \
-                 KV cache state may be inconsistent"
-            );
-        }
-    }
 }
 
 pub(crate) fn load_context_moe(

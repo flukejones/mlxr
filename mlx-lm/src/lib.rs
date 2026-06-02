@@ -15,6 +15,7 @@ pub mod quantization;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod sampler;
+pub mod speculative;
 pub mod user_input;
 pub mod utils;
 

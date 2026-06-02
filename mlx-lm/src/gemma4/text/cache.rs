@@ -61,6 +61,13 @@ impl KeyValueCache for LayerCache {
         }
     }
 
+    fn current_kv(&self) -> Result<Option<(Array, Array)>, Exception> {
+        match self {
+            Self::Global(c) => c.current_kv(),
+            Self::Sliding(c) => c.current_kv(),
+        }
+    }
+
     fn attention(
         &mut self,
         queries: &Array,

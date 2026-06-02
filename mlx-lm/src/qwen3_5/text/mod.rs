@@ -10,7 +10,6 @@ pub mod gated_delta_block;
 pub mod layer;
 pub mod moe;
 pub mod rope;
-pub mod sampling;
 #[allow(
     clippy::module_inception,
     reason = "text-family core types live in text.rs"

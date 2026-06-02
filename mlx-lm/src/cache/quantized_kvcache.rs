@@ -309,6 +309,18 @@ impl KeyValueCache for QuantizedKVCache {
         Ok((k_dense, v_dense))
     }
 
+    /// Dequantise the currently-stored K/V to dense without appending.
+    fn current_kv(&self) -> Result<Option<(Array, Array)>, Exception> {
+        if self.offset == 0 || self.keys_wq.is_none() {
+            return Ok(None);
+        }
+        let k = self.view_triple(true)?;
+        let v = self.view_triple(false)?;
+        let k_dense = dequantize(&k.0, &k.1, &k.2, self.group_size, self.k_bits)?;
+        let v_dense = dequantize(&v.0, &v.1, &v.2, self.group_size, self.v_bits)?;
+        Ok(Some((k_dense, v_dense)))
+    }
+
     fn attention(
         &mut self,
         queries: &Array,

@@ -30,7 +30,7 @@ use crate::loader::apply_post_load_memory_policy;
 use crate::nn::router_topk::{make_router_topk_kernel, router_topk};
 use crate::nn::switch::{SplitSwitchFfn, SwigluActivation};
 use crate::nn::SwigluMlp;
-use crate::quantization::QuantizationConfig;
+use crate::quantization::{requantise_linear, QuantizationConfig};
 use crate::qwen3_5::text::config::ModelConfig;
 
 /// Process-wide cached router top-k kernel handle, shared across every
@@ -156,34 +156,6 @@ fn make_moe_language_model(cfg: &TextConfig) -> Result<Qwen35MoeModel, Error> {
             c.num_experts_per_tok,
         )
     })
-}
-
-/// Re-quantise one linear slot at override `(group_size, bits)`. The
-/// slot is already body-quantised; rebuild a fresh `Linear` at the
-/// original `[out, in]` dims (recovered from the packed inner weight
-/// shape) then quantise at the override settings. The loader overwrites
-/// the values afterward — only the slot's `(group_size, bits)` + shape
-/// contract matters here.
-fn requantise_linear(
-    slot: &mut MaybeQuantized<nn::Linear>,
-    group_size: i32,
-    bits: i32,
-) -> Result<(), Error> {
-    let dummy = nn::LinearBuilder::new(1, 1).bias(false).build()?;
-    let linear = match std::mem::replace(slot, MaybeQuantized::Original(dummy)) {
-        MaybeQuantized::Original(l) => l,
-        MaybeQuantized::Quantized(q) => {
-            // Inner weight is packed uint32 `[out, in / (32 / body_bits)]`.
-            let shape = q.inner.weight.as_ref().shape();
-            let out_features = shape[0];
-            let in_features = shape[1] * (32 / q.bits);
-            nn::LinearBuilder::new(in_features, out_features)
-                .bias(false)
-                .build()?
-        }
-    };
-    *slot = MaybeQuantized::Original(linear).try_into_quantized(group_size, bits)?;
-    Ok(())
 }
 
 /// Body quantise, then re-quantise the per-layer override slots

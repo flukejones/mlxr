@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use crate::error::Error;
 use crate::gemma4::text::config as gemma4;
+use crate::gemma4_unified::config as gemma4_unified;
 use crate::llama::text::config as llama;
 use crate::quantization::QuantizationConfig;
 use crate::qwen3::text::config as qwen3;
@@ -85,6 +86,12 @@ pub enum Family {
         alias = "gemma4forcausallm"
     )]
     Gemma4(gemma4::ModelConfig),
+    #[serde(
+        rename = "gemma4_unified",
+        alias = "gemma4_unified_text",
+        alias = "gemma4unifiedforconditionalgeneration"
+    )]
+    Gemma4Unified(gemma4_unified::ModelConfig),
 }
 
 impl Family {
@@ -97,6 +104,7 @@ impl Family {
             Self::Qwen35Moe(_) => "qwen3_5_moe",
             Self::Qwen35Vl(_) => "qwen3_5_vl",
             Self::Gemma4(_) => "gemma4",
+            Self::Gemma4Unified(_) => "gemma4_unified",
         }
     }
 
@@ -124,6 +132,13 @@ impl Family {
     pub fn as_gemma4(&self) -> Option<&gemma4::ModelConfig> {
         match self {
             Self::Gemma4(env) => Some(env),
+            _ => None,
+        }
+    }
+
+    pub fn as_gemma4_unified(&self) -> Option<&gemma4_unified::ModelConfig> {
+        match self {
+            Self::Gemma4Unified(env) => Some(env),
             _ => None,
         }
     }

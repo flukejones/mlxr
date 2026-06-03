@@ -16,7 +16,7 @@ use crate::language_model::{LanguageModel, UserInputProcessor};
 use crate::lm_input::{LMInput, PrepareResult, Text};
 use crate::sampler::{Sampler, SamplerState};
 use crate::user_input::UserInput;
-use crate::{gemma4, llama, qwen3, qwen3_5};
+use crate::{gemma4, gemma4_unified, llama, qwen3, qwen3_5};
 
 /// Sampling + stopping knobs handed to [`generate`].
 #[derive(Debug, Clone)]
@@ -91,8 +91,8 @@ pub fn load(dir: impl AsRef<Path>) -> Result<ModelContext, Error> {
 }
 
 /// Like [`load`] but with an optional MTP drafter (assistant) checkpoint dir.
-/// Only the gemma4 family consumes it; passing a drafter for any other family
-/// is an error.
+/// Only the gemma4 / gemma4_unified families consume it; passing a drafter for
+/// any other family is an error.
 pub fn load_with_drafter(
     dir: impl AsRef<Path>,
     draft_dir: Option<&Path>,
@@ -114,9 +114,9 @@ fn dispatch_load(
     dir: &Path,
     draft_dir: Option<&Path>,
 ) -> Result<LoadedContext, Error> {
-    if draft_dir.is_some() && !matches!(cfg.family, Family::Gemma4(_)) {
+    if draft_dir.is_some() && !matches!(cfg.family, Family::Gemma4(_) | Family::Gemma4Unified(_)) {
         return Err(Error::config(
-            "an MTP drafter is only supported for the gemma4 family",
+            "an MTP drafter is only supported for the gemma4 families",
         ));
     }
     match &cfg.family {
@@ -126,6 +126,7 @@ fn dispatch_load(
             qwen3_5::load_context(cfg, dir)
         }
         Family::Gemma4(_) => gemma4::load_context(cfg, dir, draft_dir),
+        Family::Gemma4Unified(_) => gemma4_unified::load_context(cfg, dir, draft_dir),
     }
 }
 

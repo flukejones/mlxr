@@ -10,7 +10,16 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::builder::Builder;
+use mlx_rs::nn;
+use mlx_rs::quantization::{MaybeQuantized, Quantizable};
 use serde::Deserialize;
+
+use crate::error::Error;
+
+/// Bits packed per `uint32` inner-weight element: a quantised `Linear`'s
+/// packed weight has shape `[out, in / (BITS_PER_U32 / bits)]`.
+const BITS_PER_U32: i32 = 32;
 
 /// Quantisation mode from `quantization.mode`. Every production
 /// checkpoint ships `affine`; unknown values reject at deserialize.
@@ -41,6 +50,36 @@ impl QuantizationConfig {
             .copied()
             .unwrap_or((self.group_size, self.bits))
     }
+}
+
+/// Re-quantise one body-quantised linear slot at an override `(group_size,
+/// bits)`. Rebuilds a fresh `Linear` at the original `[out, in]` dims
+/// (recovered from the packed inner weight shape) then quantises at the
+/// override; the caller overwrites the values afterward, so only the slot's
+/// `(group_size, bits)` + shape contract matters here.
+///
+/// Used by loaders for mixed-quant checkpoints where some tensors ship at a
+/// different bit width than the body (e.g. mlx-community 4-bit models keep
+/// gate/MLP projections at 8-bit).
+pub fn requantise_linear(
+    slot: &mut MaybeQuantized<nn::Linear>,
+    group_size: i32,
+    bits: i32,
+) -> Result<(), Error> {
+    let dummy = nn::LinearBuilder::new(1, 1).bias(false).build()?;
+    let linear = match std::mem::replace(slot, MaybeQuantized::Original(dummy)) {
+        MaybeQuantized::Original(l) => l,
+        MaybeQuantized::Quantized(q) => {
+            let shape = q.inner.weight.as_ref().shape();
+            let out_features = shape[0];
+            let in_features = shape[1] * (BITS_PER_U32 / q.bits);
+            nn::LinearBuilder::new(in_features, out_features)
+                .bias(false)
+                .build()?
+        }
+    };
+    *slot = MaybeQuantized::Original(linear).try_into_quantized(group_size, bits)?;
+    Ok(())
 }
 
 /// Body knobs deserialize directly; every other entry flows into

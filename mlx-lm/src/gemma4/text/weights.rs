@@ -23,9 +23,10 @@ use mlx_rs::Array;
 
 use crate::config::ModelConfig as Config;
 use crate::error::Error;
-use crate::gemma4::text::config::ModelConfig;
+use crate::gemma4::text::config::TextConfig;
 use crate::gemma4::text::text::Model;
 use crate::loader::{apply_post_load_memory_policy, list_shards, rewrite_quantised_keys};
+use crate::quantization::{requantise_linear, QuantizationConfig};
 
 /// Substrings that mark a checkpoint key for unconditional removal.
 const DROP_SUBSTRINGS: &[&str] = &[
@@ -34,6 +35,8 @@ const DROP_SUBSTRINGS: &[&str] = &[
     "audio_tower",
     "embed_audio",
     "embed_vision",
+    // gemma4_unified encoder-free vision front-end; dropped on the text path.
+    "vision_embedder",
     "self_attn.rotary_emb",
     "input_max",
     "input_min",
@@ -111,22 +114,50 @@ pub(crate) fn load_sanitized_weights(
     Ok(rewrite_quantised_keys(raw))
 }
 
+/// After body quantisation, re-quantise per-tensor override slots at their
+/// declared bit width. mlx-community 4-bit gemma4 ships the dense MLP
+/// projections (`mlp.{gate,down,up}_proj`) at 8-bit while the body is 4-bit;
+/// a uniform body quant builds those slots at the wrong width and the
+/// quantized matmul then fails on the scale shape.
+fn quantize_mlp_overrides(model: &mut Model, q: &QuantizationConfig) -> Result<(), Error> {
+    if q.overrides.is_empty() {
+        return Ok(());
+    }
+    for (layer_idx, layer) in model.model.layers.iter_mut().enumerate() {
+        for (proj, slot) in [
+            ("gate_proj", &mut layer.mlp.gate_proj),
+            ("down_proj", &mut layer.mlp.down_proj),
+            ("up_proj", &mut layer.mlp.up_proj),
+        ] {
+            let path = format!("language_model.model.layers.{layer_idx}.mlp.{proj}");
+            let (gs, bits) = q.for_path(&path);
+            if (gs, bits) != (q.group_size, q.bits) {
+                requantise_linear(slot, gs, bits)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build `Model::new`, apply quantisation, load sanitised weights into the
-/// parameter walk, then `eval_params`.
+/// parameter walk, then `eval_params`. Takes the bare [`TextConfig`] so both
+/// the gemma4 and gemma4_unified families (which carry the same text config in
+/// different envelopes) share one loader.
 pub(crate) fn load_model(
     cfg: &Config,
-    env: &ModelConfig,
+    text_config: &TextConfig,
     model_dir: &Path,
 ) -> Result<Model, Error> {
-    let mut model = Model::new(env.text_config.clone())?;
+    let mut model = Model::new(text_config.clone())?;
     if let Some(q) = cfg.quantization() {
         model = model.try_into_quantized(q.group_size, q.bits)?;
+        quantize_mlp_overrides(&mut model, q)?;
     }
 
     let weights = load_sanitized_weights(
         model_dir,
-        env.text_config.num_hidden_layers,
-        env.text_config.num_kv_shared_layers,
+        text_config.num_hidden_layers,
+        text_config.num_kv_shared_layers,
     )?;
 
     let mut leftover: Vec<String> = Vec::new();
@@ -160,6 +191,9 @@ pub(crate) fn load_model(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::missing_assert_message, reason = "test code")]
+    use mlx_rs::nn;
+    use mlx_rs::quantization::{MaybeQuantized, Quantizable};
+
     use super::*;
 
     #[test]
@@ -191,5 +225,45 @@ mod tests {
             rewrite_outer_key("model.layers.0.self_attn.q_proj.weight"),
             "model.layers.0.self_attn.q_proj.weight"
         );
+    }
+
+    /// mlx-community 4-bit gemma4 ships the dense MLP projections at 8-bit
+    /// while the body is 4-bit. The override pass must build those slots at
+    /// 8-bit; a uniform 4-bit body quant otherwise crashes the matmul on the
+    /// scale shape.
+    #[test]
+    fn mlp_overrides_quantize_at_8bit_over_4bit_body() {
+        #![allow(clippy::unwrap_used, reason = "test code")]
+        let cfg: TextConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "head_dim": 16,
+            "global_head_dim": 16,
+            "num_key_value_heads": 2,
+            "vocab_size": 128,
+            "layer_types": ["sliding_attention", "full_attention"],
+        }))
+        .unwrap();
+        let q: QuantizationConfig = serde_json::from_value(serde_json::json!({
+            "group_size": 64,
+            "bits": 4,
+            "language_model.model.layers.0.mlp.gate_proj": { "group_size": 64, "bits": 8 },
+        }))
+        .unwrap();
+
+        let mut model = Model::new(cfg).unwrap();
+        model = model.try_into_quantized(q.group_size, q.bits).unwrap();
+        quantize_mlp_overrides(&mut model, &q).unwrap();
+
+        let bits = |slot: &MaybeQuantized<nn::Linear>| match slot {
+            MaybeQuantized::Quantized(l) => l.bits,
+            MaybeQuantized::Original(_) => panic!("slot not quantized"),
+        };
+        // Layer 0 gate_proj has an 8-bit override; everything else stays 4-bit.
+        assert_eq!(bits(&model.model.layers[0].mlp.gate_proj), 8);
+        assert_eq!(bits(&model.model.layers[0].mlp.down_proj), 4);
+        assert_eq!(bits(&model.model.layers[1].mlp.gate_proj), 4);
     }
 }

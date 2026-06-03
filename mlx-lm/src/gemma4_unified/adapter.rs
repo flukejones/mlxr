@@ -1,10 +1,10 @@
-//! Gemma 4 dense [`crate::LanguageModel`] adapter.
+//! Gemma 4 Unified text [`crate::LanguageModel`] adapter.
 //!
-//! Gemma 4 uses a per-layer sliding/global cache enum
-//! ([`crate::gemma4::text::cache::LayerCache`]) instead of the bare
-//! [`crate::cache::KVCache`] used by llama / qwen3. The
-//! `Vec<Option<LayerCache>>` slots are built up front by
-//! [`crate::gemma4::text::cache::make_caches`].
+//! Reuses the dense [`crate::gemma4::text::text::Model`], the per-layer
+//! sliding/global cache ([`crate::gemma4::text::cache::LayerCache`]), and the
+//! [`crate::gemma4::mtp`] speculative-decode stack — the unified text backbone
+//! and its assistant drafter are structurally identical to the older gemma4
+//! family (only the `model_type` discriminants differ).
 
 use std::path::Path;
 
@@ -20,19 +20,20 @@ use crate::gemma4::mtp::decode::{mtp_step, MtpContext};
 use crate::gemma4::mtp::drafter::Drafter;
 use crate::gemma4::mtp::weights::load_drafter;
 use crate::gemma4::text::cache::{make_caches, LayerCache};
-use crate::gemma4::text::config::{ModelConfig, TextConfig};
+use crate::gemma4::text::config::TextConfig;
 use crate::gemma4::text::text::Model;
 use crate::gemma4::text::weights::load_model;
+use crate::gemma4_unified::config::ModelConfig;
 use crate::language_model::{LanguageModel, TextOnlyProcessor};
 use crate::lm_input::{LMInput, LMOutput, PrepareResult};
 use crate::loader::{load_tokenizer, resolve_bos_id};
 use crate::nn::ModelInput;
 use crate::sampler::SamplerState;
 
-/// Upper bound on drafter depth γ (31B uses 8).
+/// Upper bound on drafter depth γ.
 const MAX_DRAFT_DEPTH: u32 = 8;
 
-pub(crate) struct Gemma4Adapter {
+pub(crate) struct Gemma4UnifiedAdapter {
     model: Model,
     cache: Vec<Option<LayerCache>>,
     args: TextConfig,
@@ -45,13 +46,16 @@ pub(crate) struct Gemma4Adapter {
     draft_depth: u32,
 }
 
-impl Gemma4Adapter {
+impl Gemma4UnifiedAdapter {
     fn load(
         cfg: &Config,
         env: &ModelConfig,
         dir: &Path,
         draft_dir: Option<&Path>,
     ) -> Result<Self, Error> {
+        // Unified text weights live under `language_model.*`; the gemma4 text
+        // loader already rewrites that prefix and drops the encoder-free
+        // vision/audio keys (`vision_embedder` / `embed_vision` / `embed_audio`).
         let model = load_model(cfg, &env.text_config, dir)?;
         let args = model.args.clone();
         let vocab_size = args.vocab_size;
@@ -78,9 +82,7 @@ impl Gemma4Adapter {
             draft_depth,
         })
     }
-}
 
-impl Gemma4Adapter {
     /// Forward `inputs`, advancing the cache. When a drafter is loaded, also
     /// capture the last-position post-norm hidden as the next draft anchor.
     fn forward_capturing(&mut self, inputs: &Array) -> Result<Array, Error> {
@@ -100,7 +102,7 @@ impl Gemma4Adapter {
     }
 }
 
-impl LanguageModel for Gemma4Adapter {
+impl LanguageModel for Gemma4UnifiedAdapter {
     fn reset(&mut self) {
         self.cache = make_caches(&self.args, self.cache_options);
         self.prev_hidden = None;
@@ -123,9 +125,8 @@ impl LanguageModel for Gemma4Adapter {
         self.vocab_size
     }
 
-    /// Gemma 4's sliding layers cap each forward at `sliding_window` K/V
-    /// positions; combine with the user cap (which may narrow further but
-    /// never exceed the window).
+    /// Sliding layers cap each forward at `sliding_window` K/V positions;
+    /// combine with the user cap (never exceeding the window).
     fn prefill_chunk_size(&self) -> Option<i32> {
         effective_prefill_chunk_opt(&self.cache, self.cache_options.max_prefill_chunk)
     }
@@ -175,11 +176,11 @@ pub(crate) fn load_context(
     dir: &Path,
     draft_dir: Option<&Path>,
 ) -> Result<LoadedContext, Error> {
-    let model = Gemma4Adapter::load(cfg, env, dir, draft_dir)?;
+    let model = Gemma4UnifiedAdapter::load(cfg, env, dir, draft_dir)?;
     let tokenizer = load_tokenizer(dir)?;
     let bos_id = resolve_bos_id(dir, &tokenizer);
     let chat_template = ChatTemplate::from_dir(dir)?;
     let eos_ids = EosSpec::to_vec(env.eos_token_id.as_ref());
-    let processor = TextOnlyProcessor::new("gemma4", tokenizer, chat_template, bos_id);
+    let processor = TextOnlyProcessor::new("gemma4_unified", tokenizer, chat_template, bos_id);
     Ok((Box::new(model), Box::new(processor), eos_ids))
 }

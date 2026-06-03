@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::error::Error;
 use crate::gemma4::text::config::TextConfig;
+use crate::quantization::QuantizationConfig;
 
 /// Default γ. With the draft confidence gate (see
 /// [`crate::speculative::draft_gate_for`]), depth-2 is the throughput optimum:
@@ -38,6 +39,10 @@ pub struct DrafterConfig {
     pub num_centroids: i32,
     #[serde(default = "default_centroid_top_k")]
     pub centroid_intermediate_top_k: i32,
+    /// Quantisation of the drafter weights (present on quantised assistant
+    /// checkpoints, e.g. `*-assistant-8bit`); `None` for bf16 drafters.
+    #[serde(default)]
+    pub quantization: Option<QuantizationConfig>,
 }
 
 const fn default_num_centroids() -> i32 {

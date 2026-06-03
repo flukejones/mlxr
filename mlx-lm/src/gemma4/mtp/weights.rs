@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_rs::module::ModuleParameters;
+use mlx_rs::quantization::Quantizable;
 use mlx_rs::transforms::eval_params;
 use mlx_rs::Array;
 
@@ -31,6 +32,12 @@ fn rewrite_key(key: &str) -> String {
 
 pub fn load_drafter(cfg: &DrafterConfig, dir: &Path) -> Result<Drafter, Error> {
     let mut drafter = Drafter::new(cfg)?;
+    // Quantised assistant checkpoints (e.g. `*-assistant-8bit`) carry their
+    // own quantisation; the drafter param walk then expects `…inner.weight`
+    // keys, matching `rewrite_quantised_keys` output below.
+    if let Some(q) = cfg.quantization.as_ref() {
+        drafter = drafter.try_into_quantized(q.group_size, q.bits)?;
+    }
 
     let shards = list_shards(dir)?;
     let mut raw: HashMap<String, Array> = HashMap::new();

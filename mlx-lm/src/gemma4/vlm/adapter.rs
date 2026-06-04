@@ -322,7 +322,11 @@ impl UserInputProcessor for Gemma4Processor {
                 all.extend(p);
             }
             let pixels = Array::from_slice(&all, &[n, 3, h, w]);
-            Some(ProcessedImage { pixels, grids })
+            Some(ProcessedImage {
+                pixels,
+                grids,
+                position_ids: None,
+            })
         };
 
         Ok(LMInput {

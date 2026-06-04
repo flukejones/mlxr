@@ -12,6 +12,8 @@ use crate::family::LoadedContext;
 
 pub mod adapter;
 pub mod config;
+#[cfg(feature = "image")]
+pub mod image;
 
 pub(crate) fn load_context(
     cfg: &ModelConfig,
@@ -21,5 +23,14 @@ pub(crate) fn load_context(
     let env = cfg.family.as_gemma4_unified().ok_or_else(|| {
         Error::config("gemma4_unified::load_context: not a gemma4_unified config")
     })?;
+
+    // VLM checkpoint (vision_config + processor_config.json) → multimodal
+    // adapter. A drafter composes: image affects prefill only, MTP decodes off
+    // the populated KV cache.
+    #[cfg(feature = "image")]
+    if env.vision_config.is_some() && dir.join("processor_config.json").exists() {
+        return image::adapter::load_context_vlm(cfg, env, dir, draft_dir);
+    }
+
     adapter::load_context(cfg, env, dir, draft_dir)
 }

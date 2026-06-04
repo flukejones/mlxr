@@ -101,8 +101,11 @@ pub fn list_shards(model_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(shards.into_iter().map(|s| model_dir.join(s)).collect())
 }
 
-/// Redirect quantised `<prefix>.weight` → `<prefix>.inner.weight` for
-/// keys whose `<prefix>.scales` sibling exists (MaybeQuantized layout).
+/// Redirect quantised `<prefix>.weight` → `<prefix>.inner.weight` (and a
+/// `<prefix>.bias`, if any, → `<prefix>.inner.bias`) for keys whose
+/// `<prefix>.scales` sibling exists (MaybeQuantized layout). A quantised
+/// `Linear` keeps its real weight/bias on the wrapped `inner` linear; the
+/// quant `scales`/`biases` are siblings.
 pub fn rewrite_quantised_keys(raw: HashMap<String, Array>) -> HashMap<String, Array> {
     let quantised_prefixes: HashSet<String> = raw
         .keys()
@@ -110,13 +113,50 @@ pub fn rewrite_quantised_keys(raw: HashMap<String, Array>) -> HashMap<String, Ar
         .collect();
     raw.into_iter()
         .map(|(k, v)| {
-            let key = match k.strip_suffix(".weight") {
-                Some(prefix) if quantised_prefixes.contains(prefix) => {
-                    format!("{prefix}.inner.weight")
+            if let Some(prefix) = k.strip_suffix(".weight") {
+                if quantised_prefixes.contains(prefix) {
+                    return (format!("{prefix}.inner.weight"), v);
                 }
-                _ => k,
-            };
-            (key, v)
+            }
+            if let Some(prefix) = k.strip_suffix(".bias") {
+                if quantised_prefixes.contains(prefix) {
+                    return (format!("{prefix}.inner.bias"), v);
+                }
+            }
+            (k, v)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test code")]
+    use super::*;
+
+    /// A quantised linear with a bias: `weight`→`inner.weight`,
+    /// `bias`→`inner.bias`; the quant `scales`/`biases` siblings stay put.
+    #[test]
+    fn quantised_keys_redirect_weight_and_bias_to_inner() {
+        let mk = || Array::from_slice(&[0.0f32], &[1]);
+        let raw: HashMap<String, Array> = [
+            ("patch_dense.weight", mk()),
+            ("patch_dense.bias", mk()),
+            ("patch_dense.scales", mk()),
+            ("patch_dense.biases", mk()),
+            ("norm.weight", mk()), // un-quantised: untouched
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let out = rewrite_quantised_keys(raw);
+        assert!(out.contains_key("patch_dense.inner.weight"));
+        assert!(out.contains_key("patch_dense.inner.bias"));
+        // Quant siblings and un-quantised keys are unchanged.
+        assert!(out.contains_key("patch_dense.scales"));
+        assert!(out.contains_key("patch_dense.biases"));
+        assert!(out.contains_key("norm.weight"));
+        assert!(!out.contains_key("patch_dense.weight"));
+        assert!(!out.contains_key("patch_dense.bias"));
+    }
 }

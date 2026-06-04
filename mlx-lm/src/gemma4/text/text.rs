@@ -1002,6 +1002,21 @@ impl Model {
         let out = self.model.forward_embeds(inputs_embeds, inputs, cache)?;
         self.apply_head(&out)
     }
+
+    /// As [`Self::forward_embeds`] but also returns the post-norm hidden, so a
+    /// VLM prefill can seed the MTP drafter's `prev_hidden` anchor — image
+    /// affects prefill only, MTP then decodes off the populated cache.
+    #[cfg(feature = "image")]
+    pub fn forward_embeds_hidden_and_logits<C: KeyValueCache>(
+        &mut self,
+        inputs_embeds: Array,
+        inputs: &Array,
+        cache: &mut [Option<C>],
+    ) -> Result<(Array, Array), Error> {
+        let hidden = self.model.forward_embeds(inputs_embeds, inputs, cache)?;
+        let logits = self.apply_head(&hidden)?;
+        Ok((hidden, logits))
+    }
 }
 
 impl Model {

@@ -242,7 +242,11 @@ impl UserInputProcessor for Qwen35Processor {
             // the vision tower sees one `[total_patches, feature_dim]`
             // input; `vision.forward` slices them back apart using `grids`.
             let pixels = concat_patches(pixel_arrays)?;
-            Some(ProcessedImage { pixels, grids })
+            Some(ProcessedImage {
+                pixels,
+                grids,
+                position_ids: None,
+            })
         };
 
         Ok(LMInput {

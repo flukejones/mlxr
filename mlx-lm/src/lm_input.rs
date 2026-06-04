@@ -48,6 +48,11 @@ pub struct ProcessedImage {
 
     /// One `[t, h, w]` patch-grid per image, in `UserInput::images` order.
     pub grids: Vec<[i32; 3]>,
+
+    /// Per-patch 2D position ids `[num_images, num_patches, 2]` (`-1` padding)
+    /// for encoder-free vision (gemma4_unified). `None` for tower-based
+    /// families (qwen3.5, gemma4 SigLIP) that derive positions internally.
+    pub position_ids: Option<Array>,
 }
 
 /// Pre-processed log-mel audio, ready for the model's audio tower.

@@ -13,6 +13,8 @@ use serde::Deserialize;
 
 use crate::family::EosSpec;
 use crate::gemma4::text::config::TextConfig;
+#[cfg(feature = "image")]
+use crate::gemma4_unified::image::config::VisionConfig;
 
 /// Outer `config.json` body for `model_type: gemma4_unified`. Stored inside
 /// [`crate::config::Family::Gemma4Unified`]; quantisation lives on the outer
@@ -23,6 +25,10 @@ pub struct ModelConfig {
     /// Optional explicit EOS token(s): a single id or a list.
     #[serde(default)]
     pub eos_token_id: Option<EosSpec>,
+
+    /// Encoder-free vision embedder config; present on VLM checkpoints.
+    #[cfg(feature = "image")]
+    pub vision_config: Option<VisionConfig>,
 
     /// Placeholder token each `<image>` expands to (one per soft token).
     #[serde(default = "default_image_token_id")]

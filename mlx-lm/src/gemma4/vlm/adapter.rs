@@ -166,7 +166,7 @@ impl LanguageModel for Gemma4VlmAdapter {
         }
         #[cfg(feature = "audio")]
         if let Some(audio) = audio {
-            let features = self.encode_audio(&audio.mel)?;
+            let features = self.encode_audio(&audio.features)?;
             embeds = stitch_audio_features(&features, &embeds, &input_ids, self.audio_token_id)?;
         }
         let logits = self
@@ -333,7 +333,7 @@ impl UserInputProcessor for Gemma4Processor {
             text: Text { tokens, mask: None },
             image,
             #[cfg(feature = "audio")]
-            audio: audio_mel.map(|mel| ProcessedAudio { mel }),
+            audio: audio_mel.map(|features| ProcessedAudio { features }),
         })
     }
 

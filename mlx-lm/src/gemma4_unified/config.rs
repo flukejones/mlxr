@@ -13,6 +13,8 @@ use serde::Deserialize;
 
 use crate::family::EosSpec;
 use crate::gemma4::text::config::TextConfig;
+#[cfg(feature = "audio")]
+use crate::gemma4_unified::audio::config::AudioConfig;
 #[cfg(feature = "image")]
 use crate::gemma4_unified::image::config::VisionConfig;
 
@@ -29,6 +31,10 @@ pub struct ModelConfig {
     /// Encoder-free vision embedder config; present on VLM checkpoints.
     #[cfg(feature = "image")]
     pub vision_config: Option<VisionConfig>,
+
+    /// Encoder-free audio embedder config; present on audio checkpoints.
+    #[cfg(feature = "audio")]
+    pub audio_config: Option<AudioConfig>,
 
     /// Placeholder token each `<image>` expands to (one per soft token).
     #[serde(default = "default_image_token_id")]

@@ -20,6 +20,8 @@ use crate::chat_template::{ChatMessage, ChatTemplate, ContentPart, MessageConten
 use crate::config::ModelConfig as Config;
 use crate::error::Error;
 use crate::family::{EosSpec, LoadedContext};
+#[cfg(feature = "audio")]
+use crate::gemma4::audio::multimodal::stitch_audio_features;
 use crate::gemma4::image::multimodal::stitch_image_features;
 use crate::gemma4::mtp::config::DrafterConfig;
 use crate::gemma4::mtp::decode::{mtp_step, MtpContext};
@@ -28,11 +30,19 @@ use crate::gemma4::mtp::weights::load_drafter;
 use crate::gemma4::text::cache::{make_caches, LayerCache};
 use crate::gemma4::text::config::TextConfig;
 use crate::gemma4::text::text::Model;
+#[cfg(feature = "audio")]
+use crate::gemma4_unified::audio::embedder::AudioEmbedder;
+#[cfg(feature = "audio")]
+use crate::gemma4_unified::audio::feature::{frame_waveform, num_audio_tokens};
+#[cfg(feature = "audio")]
+use crate::gemma4_unified::audio::weights::load_audio_embedder;
 use crate::gemma4_unified::config::ModelConfig;
 use crate::gemma4_unified::image::embedder::VisionEmbedder;
 use crate::gemma4_unified::image::processor::Gemma4UnifiedImageProcessor;
 use crate::gemma4_unified::image::weights::{load_full_model, LoadedVlm};
 use crate::language_model::{LanguageModel, UserInputProcessor};
+#[cfg(feature = "audio")]
+use crate::lm_input::ProcessedAudio;
 use crate::lm_input::{LMInput, LMOutput, PrepareResult, ProcessedImage, Text};
 use crate::loader::{load_tokenizer, resolve_bos_id};
 use crate::nn::ModelInput;
@@ -48,6 +58,10 @@ const MAX_DRAFT_DEPTH: u32 = 8;
 pub(crate) struct Gemma4UnifiedVlmAdapter {
     model: Model,
     embedder: VisionEmbedder,
+    #[cfg(feature = "audio")]
+    audio_embedder: Option<AudioEmbedder>,
+    #[cfg(feature = "audio")]
+    audio_token_id: u32,
     cache: Vec<Option<LayerCache>>,
     args: TextConfig,
     image_token_id: u32,
@@ -64,6 +78,7 @@ impl Gemma4UnifiedVlmAdapter {
     fn new(
         loaded: LoadedVlm,
         env: &ModelConfig,
+        #[cfg(feature = "audio")] audio_embedder: Option<AudioEmbedder>,
         drafter: Option<Drafter>,
         draft_depth: u32,
     ) -> Self {
@@ -78,6 +93,10 @@ impl Gemma4UnifiedVlmAdapter {
         Self {
             model,
             embedder,
+            #[cfg(feature = "audio")]
+            audio_embedder,
+            #[cfg(feature = "audio")]
+            audio_token_id: env.audio_token_id,
             cache,
             args,
             image_token_id: env.image_token_id,
@@ -87,6 +106,19 @@ impl Gemma4UnifiedVlmAdapter {
             prev_hidden: None,
             draft_depth,
         }
+    }
+
+    /// Run the audio embedder over raw frames `[1, T, samples_per_token]` →
+    /// soft tokens `[T, text_hidden]`.
+    #[cfg(feature = "audio")]
+    fn encode_audio(&mut self, frames: &Array) -> Result<Array, Error> {
+        let embedder = self
+            .audio_embedder
+            .as_mut()
+            .ok_or_else(|| Error::config("gemma4_unified: checkpoint has no audio embedder"))?;
+        let out = embedder.forward(frames)?;
+        let shape = out.shape();
+        Ok(out.reshape(&[shape[1], shape[2]])?)
     }
 
     /// Embed each image's merged patches, strip padding (position id `-1`),
@@ -144,7 +176,13 @@ impl LanguageModel for Gemma4UnifiedVlmAdapter {
 
     fn prepare(&mut self, input: LMInput) -> Result<PrepareResult, Error> {
         let image = input.image;
-        if image.is_none() {
+        #[cfg(feature = "audio")]
+        let audio = input.audio;
+        #[cfg(not(feature = "audio"))]
+        let audio: Option<()> = None;
+
+        // No modality → plain text decode (MTP-aware).
+        if image.is_none() && audio.is_none() {
             let logits = self.forward_text(&input.text.tokens)?;
             return Ok(PrepareResult::Logits(logits.index((.., -1, ..))));
         }
@@ -155,8 +193,13 @@ impl LanguageModel for Gemma4UnifiedVlmAdapter {
             let features = self.encode_images(&image)?;
             embeds = stitch_image_features(&features, &embeds, &input_ids, self.image_token_id)?;
         }
-        // Image affects prefill only; capture the hidden so MTP can decode off
-        // the populated cache.
+        #[cfg(feature = "audio")]
+        if let Some(audio) = audio {
+            let features = self.encode_audio(&audio.features)?;
+            embeds = stitch_audio_features(&features, &embeds, &input_ids, self.audio_token_id)?;
+        }
+        // Modalities affect prefill only; capture the hidden so MTP can decode
+        // off the populated cache.
         let logits = if self.drafter.is_some() {
             let (hidden, logits) =
                 self.model
@@ -236,7 +279,20 @@ pub(crate) struct Gemma4UnifiedProcessor {
     image_token_id: u32,
     boi_token_id: u32,
     eoi_token_id: u32,
+    /// `Some` iff the checkpoint declares an `audio_config`.
+    #[cfg(feature = "audio")]
+    audio_samples_per_token: Option<i32>,
+    #[cfg(feature = "audio")]
+    audio_token_id: u32,
+    #[cfg(feature = "audio")]
+    boa_token_id: u32,
+    #[cfg(feature = "audio")]
+    eoa_token_id: u32,
 }
+
+/// Audio placeholder the gemma chat template emits per `ContentPart::Audio`.
+#[cfg(feature = "audio")]
+const AUDIO_MARKER: &str = "<|audio|>";
 
 impl UserInputProcessor for Gemma4UnifiedProcessor {
     fn family(&self) -> &'static str {
@@ -273,8 +329,23 @@ impl UserInputProcessor for Gemma4UnifiedProcessor {
             pos_planes.push(processed.positions);
         }
 
-        let rendered = render_prompt(&self.chat_template, input.prompt, grids.len())?;
-        let expanded = self.expand_image_markers(&rendered, &valid_counts)?;
+        // Preprocess audio clips → raw frames + per-clip token counts.
+        #[cfg(feature = "audio")]
+        let (audio_frames, audio_counts) = self.preprocess_audio(&input.audio)?;
+        #[cfg(not(feature = "audio"))]
+        let audio_counts: Vec<i32> = Vec::new();
+
+        let mut expanded = render_prompt(
+            &self.chat_template,
+            input.prompt,
+            grids.len(),
+            audio_counts.len(),
+        )?;
+        expanded = self.expand_image_markers(&expanded, &valid_counts)?;
+        #[cfg(feature = "audio")]
+        {
+            expanded = self.expand_audio_markers(&expanded, &audio_counts)?;
+        }
 
         let enc = self
             .tokenizer
@@ -286,7 +357,9 @@ impl UserInputProcessor for Gemma4UnifiedProcessor {
                 ids.insert(0, bos as i32);
             }
         }
-        count_match(&ids, self.image_token_id, &valid_counts)?;
+        count_match(&ids, self.image_token_id, &valid_counts, "image")?;
+        #[cfg(feature = "audio")]
+        count_match(&ids, self.audio_token_id, &audio_counts, "audio")?;
 
         let s = ids.len() as i32;
         let tokens = Array::from_slice(&ids, &[1, s]);
@@ -313,11 +386,14 @@ impl UserInputProcessor for Gemma4UnifiedProcessor {
             })
         };
 
+        #[cfg(feature = "audio")]
+        let audio = audio_frames.map(|features| ProcessedAudio { features });
+
         Ok(LMInput {
             text: Text { tokens, mask: None },
             image,
             #[cfg(feature = "audio")]
-            audio: None,
+            audio,
         })
     }
 
@@ -362,22 +438,90 @@ impl Gemma4UnifiedProcessor {
             Error::config(format!("gemma4_unified vlm: token id {id} has no string"))
         })
     }
+
+    /// Frame each clip into raw `[T, samples_per_token]` rows, stack along the
+    /// clip axis (`[num_clips, T, spt]`), and return per-clip token counts.
+    /// One clip per turn is the supported path; multiple require equal length.
+    #[cfg(feature = "audio")]
+    fn preprocess_audio(
+        &self,
+        clips: &[crate::user_input::Audio],
+    ) -> Result<(Option<Array>, Vec<i32>), Error> {
+        if clips.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        let spt = self.audio_samples_per_token.ok_or_else(|| {
+            Error::config("gemma4_unified: audio clip supplied but checkpoint has no audio_config")
+        })?;
+        let mut frames: Vec<f32> = Vec::new();
+        let mut counts: Vec<i32> = Vec::with_capacity(clips.len());
+        let mut tokens: Option<i32> = None;
+        for clip in clips {
+            let (clip_frames, n) = frame_waveform(&clip.samples, spt);
+            match tokens {
+                Some(t) if t != n => {
+                    return Err(Error::shape(
+                        "gemma4_unified audio: multiple clips must share length",
+                    ));
+                }
+                _ => tokens = Some(n),
+            }
+            counts.push(num_audio_tokens(clip.samples.len(), spt));
+            frames.extend(clip_frames);
+        }
+        let n_clips = clips.len() as i32;
+        let t = tokens.expect("non-empty clips set token count");
+        let arr = Array::from_slice(&frames, &[n_clips, t, spt]);
+        Ok((Some(arr), counts))
+    }
+
+    /// Replace each `<|audio|>` marker (left to right) with
+    /// `boa + audio_token×count_i + eoa`.
+    #[cfg(feature = "audio")]
+    fn expand_audio_markers(&self, text: &str, counts: &[i32]) -> Result<String, Error> {
+        let boa = self.token_str(self.boa_token_id)?;
+        let aud = self.token_str(self.audio_token_id)?;
+        let eoa = self.token_str(self.eoa_token_id)?;
+        let parts: Vec<&str> = text.split(AUDIO_MARKER).collect();
+        let markers = parts.len() - 1;
+        if markers != counts.len() {
+            return Err(Error::shape(format!(
+                "gemma4_unified audio: template emitted {markers} audio markers but {} clip(s) supplied",
+                counts.len()
+            )));
+        }
+        let mut out = String::with_capacity(text.len());
+        for (i, seg) in parts.iter().enumerate() {
+            out.push_str(seg);
+            if i < markers {
+                out.push_str(&boa);
+                for _ in 0..counts[i] {
+                    out.push_str(&aud);
+                }
+                out.push_str(&eoa);
+            }
+        }
+        Ok(out)
+    }
 }
 
-/// Render the chat template with one `ContentPart::Image` per image, then text.
+/// Render the chat template with one `ContentPart::Image` per image then one
+/// `ContentPart::Audio` per clip, followed by the text.
 fn render_prompt(
     template: &ChatTemplate,
     prompt: Prompt,
     num_images: usize,
+    num_audio: usize,
 ) -> Result<String, Error> {
     let kwargs: HashMap<String, serde_json::Value> = HashMap::new();
     match prompt {
         Prompt::Text(text) => {
-            if num_images == 0 {
+            if num_images == 0 && num_audio == 0 {
                 template.render(&[ChatMessage::user(text)], true, &kwargs)
             } else {
-                let mut parts: Vec<ContentPart> = Vec::with_capacity(num_images + 1);
+                let mut parts: Vec<ContentPart> = Vec::with_capacity(num_images + num_audio + 1);
                 parts.extend((0..num_images).map(|_| ContentPart::Image));
+                parts.extend((0..num_audio).map(|_| ContentPart::Audio));
                 parts.push(ContentPart::Text { text });
                 let msg = ChatMessage {
                     role: "user".into(),
@@ -390,13 +534,13 @@ fn render_prompt(
     }
 }
 
-/// Assert the rendered prompt holds exactly `expected.sum()` image-token slots.
-fn count_match(ids: &[i32], token_id: u32, expected: &[i32]) -> Result<(), Error> {
+/// Assert the rendered prompt holds exactly `expected.sum()` `token_id` slots.
+fn count_match(ids: &[i32], token_id: u32, expected: &[i32], kind: &str) -> Result<(), Error> {
     let observed = ids.iter().filter(|&&t| (t as u32) == token_id).count() as i32;
     let want: i32 = expected.iter().sum();
     if observed != want {
         return Err(Error::shape(format!(
-            "gemma4_unified vlm: prompt has {observed} image tokens but images expand to {want}"
+            "gemma4_unified vlm: prompt has {observed} {kind} tokens but {kind}(s) expand to {want}"
         )));
     }
     Ok(())
@@ -425,7 +569,21 @@ pub(crate) fn load_context_vlm(
         }
         None => (None, 0),
     };
-    let adapter = Gemma4UnifiedVlmAdapter::new(loaded, env, drafter, draft_depth);
+    // Optional encoder-free audio embedder.
+    #[cfg(feature = "audio")]
+    let audio_embedder = match env.audio_config.as_ref() {
+        Some(acfg) => Some(load_audio_embedder(cfg, acfg, dir)?),
+        None => None,
+    };
+
+    let adapter = Gemma4UnifiedVlmAdapter::new(
+        loaded,
+        env,
+        #[cfg(feature = "audio")]
+        audio_embedder,
+        drafter,
+        draft_depth,
+    );
     let processor = Gemma4UnifiedProcessor {
         tokenizer,
         chat_template,
@@ -434,6 +592,14 @@ pub(crate) fn load_context_vlm(
         image_token_id: env.image_token_id,
         boi_token_id: env.boi_token_id,
         eoi_token_id: env.eoi_token_id,
+        #[cfg(feature = "audio")]
+        audio_samples_per_token: env.audio_config.as_ref().map(|a| a.audio_samples_per_token),
+        #[cfg(feature = "audio")]
+        audio_token_id: env.audio_token_id,
+        #[cfg(feature = "audio")]
+        boa_token_id: env.boa_token_id,
+        #[cfg(feature = "audio")]
+        eoa_token_id: env.eoa_token_id,
     };
     Ok((Box::new(adapter), Box::new(processor), eos_ids))
 }

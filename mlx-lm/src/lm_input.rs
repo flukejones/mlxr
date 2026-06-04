@@ -55,12 +55,13 @@ pub struct ProcessedImage {
     pub position_ids: Option<Array>,
 }
 
-/// Pre-processed log-mel audio, ready for the model's audio tower.
+/// Pre-processed audio features for the model's audio path (one clip per turn).
+/// `[1, T, feat]`: log-mel (`feat=128`) for the gemma4 USM tower, or raw frames
+/// (`feat=audio_samples_per_token`) for the gemma4_unified encoder-free path.
 #[cfg(feature = "audio")]
 #[derive(Debug)]
 pub struct ProcessedAudio {
-    /// `[1, T, 128]` `f32` log-mel features (one clip per turn).
-    pub mel: Array,
+    pub features: Array,
 }
 
 /// Result of [`crate::LanguageModel::prepare`]: logits to sample now, or

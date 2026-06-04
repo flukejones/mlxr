@@ -11,6 +11,8 @@ use crate::error::Error;
 use crate::family::LoadedContext;
 
 pub mod adapter;
+#[cfg(feature = "audio")]
+pub mod audio;
 pub mod config;
 #[cfg(feature = "image")]
 pub mod image;

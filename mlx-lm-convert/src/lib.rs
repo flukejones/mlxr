@@ -16,6 +16,7 @@ mod quantize;
 mod runner;
 mod shards;
 
+pub mod gemma4_unified;
 pub mod qwen3_5;
 
 pub use plan::{QuantClass, RewriteOutput, Rewriter};

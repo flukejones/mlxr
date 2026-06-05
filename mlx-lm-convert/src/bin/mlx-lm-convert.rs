@@ -2,9 +2,8 @@
 //! `mlx_lm::load` (Rust) can read.
 //!
 //! Drives [`mlx_lm_convert::convert`] with the right per-family
-//! [`mlx_lm_convert::Rewriter`]. Today only Qwen 3.5 / 3.6 (dense + MoE,
-//! including MTP weights) is supported — the family list grows on
-//! demand.
+//! [`mlx_lm_convert::Rewriter`]. Supports Qwen 3.5 / 3.6 (dense + MoE,
+//! including MTP) and Gemma 4 Unified (gemma-4-12B, encoder-free MM).
 //!
 //! Usage:
 //!     mlx-lm-convert --src /Volumes/backup/full-models/Qwen/Qwen3.6-35B-A3B \
@@ -19,7 +18,9 @@ use std::time::Instant;
 
 use argh::FromArgs;
 use mlx_lm::{generate, load, GenerateParams, UserInput};
-use mlx_lm_convert::{convert, qwen3_5::Qwen35Rewriter, ConvertOptions};
+use mlx_lm_convert::{
+    convert, gemma4_unified::Gemma4UnifiedRewriter, qwen3_5::Qwen35Rewriter, ConvertOptions,
+};
 
 /// Quantise a bf16 safetensors checkpoint into mlx-rs-loadable form.
 #[derive(FromArgs)]
@@ -40,8 +41,8 @@ struct Args {
     #[argh(option, default = "64")]
     group_size: i32,
 
-    /// model family. Today only `qwen3_5` is supported (handles qwen 3.5
-    /// dense, qwen 3.6 dense, qwen 3.6 MoE, all incl. MTP weights).
+    /// model family: `qwen3_5` (qwen 3.5/3.6 dense + MoE, incl. MTP) or
+    /// `gemma4_unified` (gemma-4-12B, encoder-free MM).
     #[argh(option, default = "String::from(\"qwen3_5\")")]
     family: String,
 
@@ -68,7 +69,8 @@ fn main() -> anyhow::Result<()> {
         "qwen3_5" | "qwen3_6" | "qwen3_5_moe" | "qwen3_6_moe" => {
             convert(&opts, &Qwen35Rewriter::default())?
         }
-        other => anyhow::bail!("unsupported family {other:?}; only qwen3_5 family is wired"),
+        "gemma4_unified" => convert(&opts, &Gemma4UnifiedRewriter::default())?,
+        other => anyhow::bail!("unsupported family {other:?}; supported: qwen3_5, gemma4_unified"),
     };
     let dt = t.elapsed();
 
